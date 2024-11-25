@@ -16,6 +16,6 @@ class CustomTrainer(nnUNetTrainer):
         # self.initial_lr = 5e-4
     
     def run_training(self):
-        print("Custom Trainer: Starting Training with Custom Settings")
+        print("Custom Trainer: Starting Training with Custom Settings : New Version!")
         # Custom 학습 루틴 추가
         return super().run_training()
