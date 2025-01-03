@@ -6,12 +6,13 @@ from nnunetv2.training.dataloading.base_data_loader import nnUNetDataLoaderBase
 from nnunetv2.training.dataloading.nnunet_dataset import nnUNetDataset
 
 
-class nnUNetDataLoader3D(nnUNetDataLoaderBase):
+class DANNDataLoader3D(nnUNetDataLoaderBase):
     def generate_train_batch(self):
         selected_keys = self.get_indices()
         # preallocate memory for data and seg
         data_all = np.zeros(self.data_shape, dtype=np.float32)
         seg_all = np.zeros(self.seg_shape, dtype=np.int16)
+        domain_all = np.zeros((self.data_shape[0], 2), dtype=np.int16)
         case_properties = []
 
         for j, i in enumerate(selected_keys):
@@ -19,13 +20,14 @@ class nnUNetDataLoader3D(nnUNetDataLoaderBase):
             # (Lung for example)
             force_fg = self.get_do_oversample(j)
 
+            ## Domain구분을 위한 구문
             data, seg, properties = self._data.load_case(i)
-            identifier = self._data[i]
-            if identifier.startswith("CECT"):
-                domain = 0
-            elif identifier.endswith("NCCT"):
-                domain = 1
+            identifier = i
 
+            if identifier.startswith("CECT"):
+                domain = torch.tensor([1, 0], dtype=torch.int16) #one-hot encoding
+            elif identifier.startswith("NCCT"):
+                domain = torch.tensor([0, 1], dtype=torch.int16)
             case_properties.append(properties)
 
             # If we are doing the cascade then the segmentation from the previous stage will already have been loaded by
@@ -56,6 +58,8 @@ class nnUNetDataLoader3D(nnUNetDataLoaderBase):
             data_all[j] = np.pad(data, padding, 'constant', constant_values=0)
             seg_all[j] = np.pad(seg, padding, 'constant', constant_values=-1)
 
+            domain_all[j] = domain
+
         if self.transforms is not None:
             with torch.no_grad():
                 with threadpool_limits(limits=1, user_api=None):
@@ -73,14 +77,7 @@ class nnUNetDataLoader3D(nnUNetDataLoaderBase):
                     else:
                         seg_all = torch.stack(segs)
                     del segs, images
-
-            return {'data': data_all, 'target': seg_all, 'keys': selected_keys}
-
-        return {'data': data_all, 'target': seg_all, 'keys': selected_keys}
+            return {'data': data_all, 'target': seg_all, 'keys': selected_keys, 'domain' : domain_all}
+        return {'data': data_all, 'target': seg_all, 'keys': selected_keys, 'domain' : domain_all}
 
 
-if __name__ == '__main__':
-    folder = '/home/seongwoo/dataset/nnunetFrame/nnunet_preprocessed/Dataset300_Kits19NCCT/nnUNetPlans_3d_fullres'
-    ds = nnUNetDataset(folder)  # this should not load the properties!
-    dl = nnUNetDataLoader3D(ds, 5, (16, 16, 16), (16, 16, 16), None, None, None)
-    a = next(dl)
