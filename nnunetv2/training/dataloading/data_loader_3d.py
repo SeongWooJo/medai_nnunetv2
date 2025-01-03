@@ -20,12 +20,6 @@ class nnUNetDataLoader3D(nnUNetDataLoaderBase):
             force_fg = self.get_do_oversample(j)
 
             data, seg, properties = self._data.load_case(i)
-            identifier = self._data[i]
-            if identifier.startswith("CECT"):
-                domain = 0
-            elif identifier.endswith("NCCT"):
-                domain = 1
-
             case_properties.append(properties)
 
             # If we are doing the cascade then the segmentation from the previous stage will already have been loaded by
@@ -80,7 +74,7 @@ class nnUNetDataLoader3D(nnUNetDataLoaderBase):
 
 
 if __name__ == '__main__':
-    folder = '/home/seongwoo/dataset/nnunetFrame/nnunet_preprocessed/Dataset300_Kits19NCCT/nnUNetPlans_3d_fullres'
-    ds = nnUNetDataset(folder)  # this should not load the properties!
-    dl = nnUNetDataLoader3D(ds, 5, (16, 16, 16), (16, 16, 16), None, None, None)
+    folder = '/media/fabian/data/nnUNet_preprocessed/Dataset002_Heart/3d_fullres'
+    ds = nnUNetDataset(folder, 0)  # this should not load the properties!
+    dl = nnUNetDataLoader3D(ds, 5, (16, 16, 16), (16, 16, 16), 0.33, None, None)
     a = next(dl)
