@@ -12,7 +12,7 @@ class DANNDataLoader3D(nnUNetDataLoaderBase):
         # preallocate memory for data and seg
         data_all = np.zeros(self.data_shape, dtype=np.float32)
         seg_all = np.zeros(self.seg_shape, dtype=np.int16)
-        domain_all = np.zeros((self.data_shape[0], 2), dtype=np.int16)
+        domain_all = np.zeros((self.data_shape[0]), dtype=np.long)
         case_properties = []
 
         for j, i in enumerate(selected_keys):
@@ -25,9 +25,9 @@ class DANNDataLoader3D(nnUNetDataLoaderBase):
             identifier = i
 
             if identifier.startswith("CECT"):
-                domain = torch.tensor([1, 0], dtype=torch.int16) #one-hot encoding
+                domain = 1
             elif identifier.startswith("NCCT"):
-                domain = torch.tensor([0, 1], dtype=torch.int16)
+                domain = 0
             case_properties.append(properties)
 
             # If we are doing the cascade then the segmentation from the previous stage will already have been loaded by
@@ -59,6 +59,7 @@ class DANNDataLoader3D(nnUNetDataLoaderBase):
             seg_all[j] = np.pad(seg, padding, 'constant', constant_values=-1)
 
             domain_all[j] = domain
+        domain_all = torch.from_numpy(domain_all).to(torch.long)
 
         if self.transforms is not None:
             with torch.no_grad():

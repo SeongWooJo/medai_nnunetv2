@@ -40,7 +40,7 @@ from torch import autocast, nn
 from torch import distributed as dist
 from torch._dynamo import OptimizedModule
 from torch.cuda import device_count
-from torch.cuda.amp import GradScaler
+from torch.amp import GradScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from nnunetv2.configuration import ANISO_THRESHOLD, default_num_processes
@@ -89,7 +89,8 @@ class DANNTrainer(nnUNetTrainer):
         # OK OK I am guilty. But I tried.
         # https://www.osnews.com/images/comics/wtfm.jpg
         # https://i.pinimg.com/originals/26/b2/50/26b250a738ea4abc7a5af4d42ad93af0.jpg
-
+        # 디버깅 모드 활성화
+        torch.autograd.set_detect_anomaly(True)
         self.is_ddp = dist.is_available() and dist.is_initialized()
         self.local_rank = 0 if not self.is_ddp else dist.get_rank()
 
@@ -171,7 +172,7 @@ class DANNTrainer(nnUNetTrainer):
         self.f_grad_scaler = GradScaler() if self.device.type == 'cuda' else None
         
         self.loss = None  # -> self.initialize
-
+        self.log_data = {'segmentation_loss':[], 'discriminator_loss' : []}
         ### Simple logging. Don't take that away from me!
         # initialize log file. This is just our log for the print statements etc. Not to be confused with lightning
         # logging
@@ -242,6 +243,7 @@ class DANNTrainer(nnUNetTrainer):
                 self.network = DDP(self.network, device_ids=[self.local_rank])
 
             self.loss = self._build_loss()
+            self.domain_loss = nn.CrossEntropyLoss()
             # torch 2.2.2 crashes upon compiling CE loss
             # if self._do_i_compile():
             #     self.loss = torch.compile(self.loss)
@@ -340,14 +342,18 @@ class DANNTrainer(nnUNetTrainer):
         should be generated. label_manager takes care of all that for you.)
 
         """
-        return get_network_from_plans(
+        network = get_network_from_plans(
             architecture_class_name,
             arch_init_kwargs,
             arch_init_kwargs_req_import,
             num_input_channels,
             num_output_channels,
             allow_init=True,
-            deep_supervision=enable_deep_supervision).make_classifier(**classifier_args)
+            deep_supervision=enable_deep_supervision)
+        network.make_classifier(**classifier_args)
+        if hasattr(network, 'initialize'):
+            network.apply(network.initialize)
+        return network
 
     def _get_deep_supervision_scales(self):
         if self.enable_deep_supervision:
@@ -1009,8 +1015,9 @@ class DANNTrainer(nnUNetTrainer):
         data = batch['data']
         target = batch['target']
         domain_gt = batch['domain']
-        
+  
         data = data.to(self.device, non_blocking=True)
+        domain_gt = domain_gt.to(self.device, non_blocking=True)
         if isinstance(target, list):
             target = [i.to(self.device, non_blocking=True) for i in target]
         else:
@@ -1028,48 +1035,78 @@ class DANNTrainer(nnUNetTrainer):
         # So autocast will only be active if we have a cuda device.
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
             output, domain_output = self.network(data)
+            print(domain_gt)
+            print(domain_output)
             # del data
             s_l = self.loss(output, target)
-            d_l = nn.CrossEntropyLoss(domain_output, domain_gt)
-            f_l = -1 * nn.CrossEntropyLoss(domain_output, domain_gt)
+            if torch.isnan(domain_output).any():
+                print("NaN found in logits!")
+            elif torch.isinf(domain_output).any():
+                print("Inf found in logits!")
+                
+            d_l = self.domain_loss(domain_output, domain_gt)
+            f_l = 0 * d_l
             
+        #print(f"s_l = {s_l}, d_l = {d_l}")
+        if self.d_grad_scaler is not None:
+            self.d_grad_scaler.scale(d_l).backward(retain_graph=True)
+            self.d_grad_scaler.unscale_(self.d_optimizer)
+        else:
+            d_l.backward()
+        
+        if self.f_grad_scaler is not None:
+            self.f_grad_scaler.scale(f_l).backward(retain_graph=True)
+            self.f_grad_scaler.unscale_(self.f_optimizer)
+            
+        else:
+            f_l.backward()
+        
         if self.s_grad_scaler is not None:
             self.s_grad_scaler.scale(s_l).backward()
             self.s_grad_scaler.unscale_(self.s_optimizer)
             
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
-            self.s_grad_scaler.step(self.s_optimizer)           
-            self.s_grad_scaler.update()
         else:
             s_l.backward()
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
-            self.s_optimizer.step()
         
-        if self.d_grad_scaler is not None:
-            self.d_grad_scaler.scale(d_l).backward()
-            self.d_grad_scaler.unscale_(self.d_optimizer)
+        torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
             
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+        if self.d_grad_scaler is not None:
             self.d_grad_scaler.step(self.d_optimizer)           
             self.d_grad_scaler.update()
         else:
-            d_l.backward()
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
             self.d_optimizer.step()
-        
+
         if self.f_grad_scaler is not None:
-            self.f_grad_scaler.scale(f_l).backward()
-            self.f_grad_scaler.unscale_(self.f_optimizer)
-            
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
             self.f_grad_scaler.step(self.f_optimizer)           
             self.f_grad_scaler.update()
         else:
-            f_l.backward()
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
             self.f_optimizer.step()
         
-        return {'loss': s_l.detach().cpu().numpy(), 'domain_loss': d_l}
+        if self.s_grad_scaler is not None:
+            self.s_grad_scaler.step(self.s_optimizer)           
+            self.s_grad_scaler.update()
+        else:
+            self.s_optimizer.step()
+
+
+        print_log = True
+        if print_log:
+            for name, param in self.network.named_parameters():
+                if param.grad is not None:
+                    if name not in self.log_data:
+                        # key가 없으면 리스트로 초기화
+                        self.log_data[name] = [param.grad.norm().item()]
+                    else:
+                        # key가 있으면 리스트에 value 추가
+                        self.log_data[name].append(param.grad.norm().item())
+                    #print(f'{name}: {param.grad.norm().item()}')
+            # 딕셔너리를 파일에 저장
+            self.log_data['segmentation_loss'].append(s_l.detach().item())
+            self.log_data['discriminator_loss'].append(d_l.detach().item())
+            save_json(self.log_data, join("/home/seongwoo/seong_test/log", "weight.json"), sort_keys=False)
+            print(f"s_l : {s_l}, d_l : {d_l}")
+            
+        return {'loss': s_l.detach().cpu().numpy(), 'domain_loss': d_l.detach().cpu().numpy()}
 
     def on_train_epoch_end(self, train_outputs: List[dict]):
         outputs = collate_outputs(train_outputs)
@@ -1193,6 +1230,10 @@ class DANNTrainer(nnUNetTrainer):
     def on_epoch_end(self):
         self.logger.log('epoch_end_timestamps', time(), self.current_epoch)
 
+        if any(torch.isnan(param).any() for param in self.network.encoder.parameters()): print("encoder NaN found")
+        if any(torch.isnan(param).any() for param in self.network.decoder.parameters()): print("decoder NaN found")
+        if any(torch.isnan(param).any() for param in self.network.classifier.parameters()): print("classifier NaN found")
+
         self.print_to_log_file('train_loss', np.round(self.logger.my_fantastic_logging['train_losses'][-1], decimals=4))
         self.print_to_log_file('val_loss', np.round(self.logger.my_fantastic_logging['val_losses'][-1], decimals=4))
         self.print_to_log_file('Pseudo dice', [np.round(i, decimals=4) for i in
@@ -1228,8 +1269,12 @@ class DANNTrainer(nnUNetTrainer):
 
                 checkpoint = {
                     'network_weights': mod.state_dict(),
-                    'optimizer_state': self.optimizer.state_dict(),
-                    'grad_scaler_state': self.grad_scaler.state_dict() if self.grad_scaler is not None else None,
+                    's_optimizer_state': self.s_optimizer.state_dict(),
+                    'd_optimizer_state': self.d_optimizer.state_dict(),
+                    'f_optimizer_state': self.f_optimizer.state_dict(),
+                    's_grad_scaler_state': self.s_grad_scaler.state_dict() if self.s_grad_scaler is not None else None,
+                    'd_grad_scaler_state': self.d_grad_scaler.state_dict() if self.d_grad_scaler is not None else None,
+                    'f_grad_scaler_state': self.f_grad_scaler.state_dict() if self.f_grad_scaler is not None else None,
                     'logging': self.logger.get_checkpoint(),
                     '_best_ema': self._best_ema,
                     'current_epoch': self.current_epoch + 1,
@@ -1274,10 +1319,21 @@ class DANNTrainer(nnUNetTrainer):
                 self.network._orig_mod.load_state_dict(new_state_dict)
             else:
                 self.network.load_state_dict(new_state_dict)
-        self.optimizer.load_state_dict(checkpoint['optimizer_state'])
-        if self.grad_scaler is not None:
-            if checkpoint['grad_scaler_state'] is not None:
-                self.grad_scaler.load_state_dict(checkpoint['grad_scaler_state'])
+        self.s_optimizer.load_state_dict(checkpoint['s_optimizer_state'])
+        self.d_optimizer.load_state_dict(checkpoint['d_optimizer_state'])
+        self.f_optimizer.load_state_dict(checkpoint['f_optimizer_state'])
+        
+        if self.s_grad_scaler is not None:
+            if checkpoint['s_grad_scaler_state'] is not None:
+                self.s_grad_scaler.load_state_dict(checkpoint['s_grad_scaler_state'])
+        if self.d_grad_scaler is not None:
+            if checkpoint['d_grad_scaler_state'] is not None:
+                self.d_grad_scaler.load_state_dict(checkpoint['d_grad_scaler_state'])
+        if self.f_grad_scaler is not None:
+            if checkpoint['f_grad_scaler_state'] is not None:
+                self.f_grad_scaler.load_state_dict(checkpoint['f_grad_scaler_state'])
+
+
 
     def perform_actual_validation(self, save_probabilities: bool = False):
         self.set_deep_supervision_enabled(False)
