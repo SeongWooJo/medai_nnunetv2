@@ -59,6 +59,7 @@ class DANNDataLoader3D(nnUNetDataLoaderBase):
             seg_all[j] = np.pad(seg, padding, 'constant', constant_values=-1)
 
             domain_all[j] = domain
+        # CrossEntropy에 넣어주기 위해, torch.long으로 변환해서 반환
         domain_all = torch.from_numpy(domain_all).to(torch.long)
 
         if self.transforms is not None:
