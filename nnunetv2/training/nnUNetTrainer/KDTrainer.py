@@ -355,16 +355,26 @@ class KDTrainer(nnUNetTrainer):
                                    num_output_channels: int,
                                    enable_deep_supervision: bool = True) -> nn.Module:
         
-        pretrain_network = torch.load("/data/seongwoo/nnunetFrame/nnunet_results/test_checkpoint_300NCCT/fold_0/checkpoint_final.pth")['network_weights']
+        pretrain_network = torch.load("/data/seongwoo/nnunetFrame/nnunet_results/test_checkpoint_201CECT/fold_0/checkpoint_final.pth")['network_weights']
+        teacher_plans_file = '/data/seongwoo/nnunetFrame/nnunet_results/test_checkpoint_201CECT/plans.json'
+        teacher_json_file = '/data/seongwoo/nnunetFrame/nnunet_results/test_checkpoint_201CECT/dataset.json'
+        teacher_configuration = '3d_fullres'
 
+        plans = load_json(teacher_plans_file)
+        dataset_json = load_json(teacher_json_file)
+        plans_manager = PlansManager(plans)
+        configuration_manager = plans_manager.get_configuration(teacher_configuration)
+        teacher_label_manager = plans_manager.get_label_manager(dataset_json)
+        num_input_channels = determine_num_input_channels(plans_manager, configuration_manager, dataset_json)
+        
         network = get_network_from_plans(
-            architecture_class_name,
-            arch_init_kwargs,
-            arch_init_kwargs_req_import,
+            configuration_manager.network_arch_class_name,
+            configuration_manager.network_arch_init_kwargs,
+            configuration_manager.network_arch_init_kwargs_req_import,
             num_input_channels,
-            num_output_channels,
-            allow_init=True,
-            deep_supervision=enable_deep_supervision)
+            teacher_label_manager.num_segmentation_heads,
+            deep_supervision=enable_deep_supervision,
+            )
         
         if hasattr(network, 'initialize'):
             network.apply(network.initialize)

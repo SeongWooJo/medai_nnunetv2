@@ -146,7 +146,7 @@ class pretrained_DiscriminatorTrainer(nnUNetTrainer):
                 if self.is_cascaded else None
 
         ### Some hyperparameters for you to fiddle with
-        self.initial_lr = 1e-4
+        self.initial_lr = 1e-2
         self.weight_decay = 3e-5
         self.oversample_foreground_percent = 0.33
         self.num_iterations_per_epoch = 250
@@ -165,7 +165,7 @@ class pretrained_DiscriminatorTrainer(nnUNetTrainer):
         #self.optimizer = self.lr_scheduler = None  # -> self.initialize
         self.optimizer = self.lr_scheduler = None
         
-        self.grad_scaler = GradScaler() if self.device.type == 'cuda' else None
+        self.grad_scaler = None if self.device.type == 'cuda' else None
 
         self.loss = None  # -> self.initialize
         self.log_data = {'segmentation_loss':[], 'discriminator_loss' : []}
@@ -1051,9 +1051,9 @@ class pretrained_DiscriminatorTrainer(nnUNetTrainer):
         # If the device_type is 'cpu' then it's slow as heck and needs to be disabled.
         # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
         # So autocast will only be active if we have a cuda device.
-        with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
+        with autocast(self.device.type, enabled=True) if 0 else dummy_context():
             domain_output = self.network(data)
-
+            print(domain_output)
             ### 내가 만든 domain 관련 log 보려면 True로 바꾸기
             print_log = False
             if print_log:

@@ -1265,6 +1265,8 @@ class DANNTrainer4(nnUNetTrainer):
             mask = None
         domain_t = 0
         domain_f = 0
+        gt_cect = 0
+        gt_ncct = 0
         for idx, output_elem in enumerate(domain_output):
             if torch.argmax(output_elem) == domain_gt[idx]:
                 domain_t += 1

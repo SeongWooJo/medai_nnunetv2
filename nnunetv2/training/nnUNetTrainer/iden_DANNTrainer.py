@@ -63,7 +63,7 @@ from nnunetv2.utilities.collate_outputs import collate_outputs
 from nnunetv2.utilities.crossval_split import generate_crossval_split
 from nnunetv2.utilities.default_n_proc_DA import get_allowed_n_proc_DA
 from nnunetv2.utilities.file_path_utilities import check_workers_alive_and_busy
-from nnunetv2.utilities.get_network_from_plans import get_network_from_plans
+from nnunetv2.utilities.get_iden_network_from_plans import get_iden_network_from_plans
 from nnunetv2.utilities.helpers import empty_cache, dummy_context
 from nnunetv2.utilities.label_handling.label_handling import convert_labelmap_to_one_hot, determine_num_input_channels
 from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
@@ -74,7 +74,7 @@ from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
 
 
 
-class DANNTrainer5(nnUNetTrainer):
+class iden_DANNTrainer(nnUNetTrainer):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict, unpack_dataset: bool = True,
                  device: torch.device = torch.device('cuda')):
         # From https://grugbrain.dev/. Worth a read ya big brains ;-)
@@ -151,7 +151,7 @@ class DANNTrainer5(nnUNetTrainer):
 
         ### Some hyperparameters for you to fiddle with
         self.s_initial_lr = 1e-2
-        self.d_initial_lr = 1e-3
+        self.d_initial_lr = 1e-2
         self.weight_decay = 3e-5
         self.oversample_foreground_percent = 0.33
         self.num_iterations_per_epoch = 250
@@ -355,7 +355,8 @@ class DANNTrainer5(nnUNetTrainer):
                                    num_input_channels: int,
                                    num_output_channels: int,
                                    enable_deep_supervision: bool = True,
-                                   classifier_args: dict = None) -> nn.Module:
+                                   classifier_args: dict = None,
+                                   input_class : int = 1) -> nn.Module:
         """
         This is where you build the architecture according to the plans. There is no obligation to use
         get_network_from_plans, this is just a utility we use for the nnU-Net default architectures. You can do what
@@ -375,14 +376,15 @@ class DANNTrainer5(nnUNetTrainer):
         should be generated. label_manager takes care of all that for you.)
 
         """
-        network = get_network_from_plans(
+        network = get_iden_network_from_plans(
             architecture_class_name,
             arch_init_kwargs,
             arch_init_kwargs_req_import,
             num_input_channels,
             num_output_channels,
             allow_init=True,
-            deep_supervision=enable_deep_supervision)
+            deep_supervision=enable_deep_supervision,
+            input_class=input_class)
         network.make_classifier(**classifier_args)
         
         if hasattr(network, 'initialize'):
