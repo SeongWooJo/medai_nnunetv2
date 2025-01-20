@@ -46,7 +46,7 @@ def get_iden_network_from_plans(arch_class_name, arch_kwargs, arch_kwargs_req_im
 if __name__ == "__main__":
     import torch
 
-    model = get_network_from_plans(
+    model = get_iden_network_from_plans(
         arch_class_name="dynamic_network_architectures.architectures.unet.ResidualEncoderUNet",
         arch_kwargs={
             "n_stages": 7,
