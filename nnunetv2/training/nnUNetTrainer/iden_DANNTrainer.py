@@ -46,7 +46,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from nnunetv2.configuration import ANISO_THRESHOLD, default_num_processes
 from nnunetv2.evaluation.evaluate_predictions import compute_metrics_on_folder
 from nnunetv2.inference.export_prediction import export_prediction_from_logits, resample_and_save
-from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
+from nnunetv2.inference.dann_predict_from_raw_data import DANNPredictor
 from nnunetv2.inference.sliding_window_prediction import compute_gaussian
 from nnunetv2.paths import nnUNet_preprocessed, nnUNet_results
 from nnunetv2.training.data_augmentation.compute_initial_patch_size import get_patch_size
@@ -54,7 +54,7 @@ from nnunetv2.training.dataloading.data_loader_2d import nnUNetDataLoader2D
 from nnunetv2.training.dataloading.dann_data_loader_3d import DANNDataLoader3D
 from nnunetv2.training.dataloading.nnunet_dataset import nnUNetDataset
 from nnunetv2.training.dataloading.utils import get_case_identifiers, unpack_dataset
-from nnunetv2.training.logging.nnunet_logger import nnUNetLogger
+from nnunetv2.training.logging.iden_Discriminator_logger import iden_DiscriminatorLogger
 from nnunetv2.training.loss.compound_losses import DC_and_CE_loss, DC_and_BCE_loss
 from nnunetv2.training.loss.deep_supervision import DeepSupervisionWrapper
 from nnunetv2.training.loss.dice import get_tp_fp_fn_tn, MemoryEfficientSoftDiceLoss
@@ -189,8 +189,7 @@ class iden_DANNTrainer(nnUNetTrainer):
         self.log_file = join(self.output_folder, "training_log_%d_%d_%d_%02.0d_%02.0d_%02.0d.txt" %
                              (timestamp.year, timestamp.month, timestamp.day, timestamp.hour, timestamp.minute,
                               timestamp.second))
-        self.logger = nnUNetLogger()
-        self.logger.my_fantastic_logging['domain_acc'] = list()
+        self.logger = iden_DiscriminatorLogger()
         ### placeholders
         self.dataloader_train = self.dataloader_val = None  # see on_train_start
 
@@ -1205,10 +1204,15 @@ class iden_DANNTrainer(nnUNetTrainer):
             losses_tr = [None for _ in range(dist.get_world_size())]
             dist.all_gather_object(losses_tr, outputs['loss'])
             loss_here = np.vstack(losses_tr).mean()
+            domain_losses_tr = [None for _ in range(dist.get_world_size())]
+            dist.all_gather_object(domain_losses_tr, outputs['domain_loss'])
+            domain_loss_here = np.vstack(domain_losses_tr).mean()
         else:
             loss_here = np.mean(outputs['loss'])
+            domain_loss_here = np.mean(outputs['domain_loss'])
 
         self.logger.log('train_losses', loss_here, self.current_epoch)
+        self.logger.log('class_train_losses', domain_loss_here, self.current_epoch)
 
     def on_validation_epoch_start(self):
         self.network.eval()
@@ -1223,6 +1227,8 @@ class iden_DANNTrainer(nnUNetTrainer):
             target = [i.to(self.device, non_blocking=True) for i in target]
         else:
             target = target.to(self.device, non_blocking=True)
+        domain_gt = domain_gt.to(self.device, non_blocking=True)
+        
 
         # Autocast can be annoying
         # If the device_type is 'cpu' then it's slow as heck and needs to be disabled.
@@ -1232,7 +1238,7 @@ class iden_DANNTrainer(nnUNetTrainer):
             output, domain_output = self.network(data)
             del data
             l = self.loss(output, target)
-            
+            d_l = self.domain_loss(domain_output, domain_gt)
             
         # we only need the output with the highest output resolution (if DS enabled)
         if self.enable_deep_supervision:
@@ -1289,7 +1295,7 @@ class iden_DANNTrainer(nnUNetTrainer):
             fp_hard = fp_hard[1:]
             fn_hard = fn_hard[1:]
 
-        return {'loss': l.detach().cpu().numpy(), 'tp_hard': tp_hard, 'fp_hard': fp_hard, 'fn_hard': fn_hard, 'domain_t' : domain_t, 'domain_f' : domain_f}
+        return {'loss': l.detach().cpu().numpy(), 'tp_hard': tp_hard, 'fp_hard': fp_hard, 'fn_hard': fn_hard, 'domain_t' : domain_t, 'domain_f' : domain_f, 'domain_loss' : d_l.detach().cpu().numpy()}
 
     def on_validation_epoch_end(self, val_outputs: List[dict]):
         outputs_collated = collate_outputs(val_outputs)
@@ -1319,8 +1325,12 @@ class iden_DANNTrainer(nnUNetTrainer):
             losses_val = [None for _ in range(world_size)]
             dist.all_gather_object(losses_val, outputs_collated['loss'])
             loss_here = np.vstack(losses_val).mean()
+            domain_losses_val = [None for _ in range(world_size)]
+            dist.all_gather_object(domain_losses_val, outputs_collated['domain_loss'])
+            domain_loss_here = np.vstack(domain_losses_val).mean()
         else:
             loss_here = np.mean(outputs_collated['loss'])
+            domain_loss_here = np.mean(outputs_collated['domain_loss'])
 
         global_dc_per_class = [i for i in [2 * i / (2 * i + j + k) for i, j, k in zip(tp, fp, fn)]]
         mean_fg_dice = np.nanmean(global_dc_per_class)
@@ -1328,6 +1338,7 @@ class iden_DANNTrainer(nnUNetTrainer):
         self.logger.log('domain_acc', domain_acc, self.current_epoch)
         self.logger.log('dice_per_class_or_region', global_dc_per_class, self.current_epoch)
         self.logger.log('val_losses', loss_here, self.current_epoch)
+        self.logger.log('class_val_losses', domain_loss_here, self.current_epoch)
 
     def on_epoch_start(self):
         self.logger.log('epoch_start_timestamps', time(), self.current_epoch)
@@ -1341,6 +1352,7 @@ class iden_DANNTrainer(nnUNetTrainer):
 
         self.print_to_log_file('train_loss', np.round(self.logger.my_fantastic_logging['train_losses'][-1], decimals=4))
         self.print_to_log_file('val_loss', np.round(self.logger.my_fantastic_logging['val_losses'][-1], decimals=4))
+        self.print_to_log_file('class_val_loss', np.round(self.logger.my_fantastic_logging['class_val_losses'][-1], decimals=4))
         self.print_to_log_file('Pseudo dice', [np.round(i, decimals=4) for i in
                                                self.logger.my_fantastic_logging['dice_per_class_or_region'][-1]])
         self.print_to_log_file(
@@ -1450,7 +1462,7 @@ class iden_DANNTrainer(nnUNetTrainer):
                                    "forward pass (where compile is triggered) already has deep supervision disabled. "
                                    "This is exactly what we need in perform_actual_validation")
 
-        predictor = nnUNetPredictor(tile_step_size=0.5, use_gaussian=True, use_mirroring=True,
+        predictor = DANNPredictor(tile_step_size=0.5, use_gaussian=True, use_mirroring=True,
                                     perform_everything_on_device=True, device=self.device, verbose=False,
                                     verbose_preprocessing=False, allow_tqdm=False)
         predictor.manual_initialization(self.network, self.plans_manager, self.configuration_manager, None,
