@@ -63,14 +63,14 @@ from nnunetv2.utilities.collate_outputs import collate_outputs
 from nnunetv2.utilities.crossval_split import generate_crossval_split
 from nnunetv2.utilities.default_n_proc_DA import get_allowed_n_proc_DA
 from nnunetv2.utilities.file_path_utilities import check_workers_alive_and_busy
-from nnunetv2.utilities.get_network_from_plans import get_network_from_plans
+from nnunetv2.utilities.get_iden_network_from_plans import get_iden_network_from_plans
 from nnunetv2.utilities.helpers import empty_cache, dummy_context
 from nnunetv2.utilities.label_handling.label_handling import convert_labelmap_to_one_hot, determine_num_input_channels
 from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
 # MyCustomTrainer.py 파일로 저장
 from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
 from torch.utils.tensorboard import SummaryWriter
-class pretrained_DiscriminatorTrainer(nnUNetTrainer):
+class pretrained_all_DiscriminatorTrainer(nnUNetTrainer):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict, unpack_dataset: bool = True,
                  device: torch.device = torch.device('cuda')):
         # From https://grugbrain.dev/. Worth a read ya big brains ;-)
@@ -146,7 +146,7 @@ class pretrained_DiscriminatorTrainer(nnUNetTrainer):
                 if self.is_cascaded else None
 
         ### Some hyperparameters for you to fiddle with
-        self.initial_lr = 1e-4
+        self.initial_lr = 3e-4
         self.weight_decay = 3e-5
         self.oversample_foreground_percent = 0.33
         self.num_iterations_per_epoch = 250
@@ -244,7 +244,7 @@ class pretrained_DiscriminatorTrainer(nnUNetTrainer):
                 self.num_input_channels,
                 self.label_manager.num_segmentation_heads,
                 self.enable_deep_supervision,
-                self.classifier_args
+                self.classifier_args,
             ).to(self.device)
 
             # compile network for free speedup
@@ -360,7 +360,7 @@ class pretrained_DiscriminatorTrainer(nnUNetTrainer):
         """
         pretrain_network = torch.load("/data/seongwoo/nnunetFrame/pretrained_model/301_pretrained_model.pth")['network_weights']
 
-        network = get_network_from_plans(
+        network = get_iden_network_from_plans(
             architecture_class_name,
             arch_init_kwargs,
             arch_init_kwargs_req_import,
@@ -557,9 +557,11 @@ class pretrained_DiscriminatorTrainer(nnUNetTrainer):
 
     def configure_optimizers(self):
         #domain
+        
+        #optimizer = torch.optim.SGD([classifier.parameters() for classifier in self.network.classifier_list], self.initial_lr, weight_decay=self.weight_decay,
+        #                            momentum=0.99, nesterov=True)
         optimizer = torch.optim.SGD(self.network.classifier.parameters(), self.initial_lr, weight_decay=self.weight_decay,
                                     momentum=0.99, nesterov=True)
-        
         lr_scheduler = PolyLRScheduler(optimizer, self.initial_lr, self.num_epochs)
         
         return optimizer, lr_scheduler
@@ -1052,7 +1054,7 @@ class pretrained_DiscriminatorTrainer(nnUNetTrainer):
         # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
         # So autocast will only be active if we have a cuda device.
         with autocast(self.device.type, enabled=True) if 0 else dummy_context():
-            domain_output = self.network(data)
+            domain_output_list = self.network(data)
             #print(domain_output)
             ### 내가 만든 domain 관련 log 보려면 True로 바꾸기
             print_log = False
@@ -1061,6 +1063,7 @@ class pretrained_DiscriminatorTrainer(nnUNetTrainer):
                 self.output_data.append([elem for batch in temp_output for elem in batch])
 
             # del data
+            """
             if torch.isnan(domain_output).any():
                 for name, param in self.network.named_parameters():
                     if param.grad is not None:
@@ -1070,8 +1073,7 @@ class pretrained_DiscriminatorTrainer(nnUNetTrainer):
                         else:
                             # key가 있으면 리스트에 value 추가
                             self.log_data[name].append(param.grad.norm().item())
-                print("NaN found in logits!")
-                
+                print("NaN found in logits!")    
             elif torch.isinf(domain_output).any():
                 for name, param in self.network.named_parameters():
                     if param.grad is not None:
@@ -1082,8 +1084,15 @@ class pretrained_DiscriminatorTrainer(nnUNetTrainer):
                             # key가 있으면 리스트에 value 추가
                             self.log_data[name].append(param.grad.norm().item())
                 print("Inf found in logits!")
-                
+            """
+            domain_output = torch.stack(domain_output_list).mean(dim=0)
             l = self.domain_loss(domain_output, domain_gt)
+            #l_list = []
+            
+            #for domain_output in domain_output_list:
+            #    temp_l = self.domain_loss(domain_output, domain_gt)
+            #    l_list.append(temp_l)
+            #l = torch.stack(l_list).mean()
             #l = self.domain_loss(domain_output, domain_gt)
             
         #print(f"s_l = {s_l}, d_l = {d_l}")
@@ -1149,9 +1158,15 @@ class pretrained_DiscriminatorTrainer(nnUNetTrainer):
         # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
         # So autocast will only be active if we have a cuda device.
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
-            domain_output = self.network(data)
-            del data    
-            l = self.domain_loss(domain_output, domain_gt)
+            domain_output_list = self.network(data)
+            del data
+            domain_output = torch.stack(domain_output_list).mean(dim=0)
+            l = self.domain_loss(domain_output, domain_gt)    
+            #l_list = []
+            #for domain_output in domain_output_list:
+            #    temp_l = self.domain_loss(domain_output, domain_gt)
+            #    l_list.append(temp_l)
+            #l = torch.stack(l_list).mean()
         
         domain_t = 0
         domain_f = 0

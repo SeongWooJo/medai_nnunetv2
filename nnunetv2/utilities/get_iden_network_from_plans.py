@@ -7,7 +7,7 @@ from batchgenerators.utilities.file_and_folder_operations import join
 
 
 def get_iden_network_from_plans(arch_class_name, arch_kwargs, arch_kwargs_req_import, input_channels, output_channels,
-                           allow_init=True, deep_supervision: Union[bool, None] = None, input_class: int = 1):
+                           allow_init=True, deep_supervision: Union[bool, None] = None, input_class: int = 0):
     network_class = arch_class_name
     architecture_kwargs = dict(**arch_kwargs)
     for ri in arch_kwargs_req_import:
@@ -35,7 +35,7 @@ def get_iden_network_from_plans(arch_class_name, arch_kwargs, arch_kwargs_req_im
         input_channels=input_channels,
         num_classes=output_channels,
         **architecture_kwargs,
-        input_stage=input_class
+        input_stage = input_class
     )
 
     if hasattr(network, 'initialize') and allow_init:
