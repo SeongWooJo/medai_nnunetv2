@@ -46,15 +46,17 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from nnunetv2.configuration import ANISO_THRESHOLD, default_num_processes
 from nnunetv2.evaluation.evaluate_predictions import compute_metrics_on_folder
 from nnunetv2.inference.export_prediction import export_prediction_from_logits, resample_and_save
-from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
+from nnunetv2.inference.dann_predict_from_raw_data import DANNPredictor
+from nnunetv2.inference.case_predict_from_raw_data import CasePredictor
 from nnunetv2.inference.sliding_window_prediction import compute_gaussian
 from nnunetv2.paths import nnUNet_preprocessed, nnUNet_results
 from nnunetv2.training.data_augmentation.compute_initial_patch_size import get_patch_size
 from nnunetv2.training.dataloading.data_loader_2d import nnUNetDataLoader2D
+from nnunetv2.training.dataloading.data_loader_3d import nnUNetDataLoader3D
 from nnunetv2.training.dataloading.dann_data_loader_3d import DANNDataLoader3D
 from nnunetv2.training.dataloading.nnunet_dataset import nnUNetDataset
 from nnunetv2.training.dataloading.utils import get_case_identifiers, unpack_dataset
-from nnunetv2.training.logging.nnunet_logger import nnUNetLogger
+from nnunetv2.training.logging.iden_Discriminator_logger import iden_DiscriminatorLogger
 from nnunetv2.training.loss.compound_losses import DC_and_CE_loss, DC_and_BCE_loss
 from nnunetv2.training.loss.deep_supervision import DeepSupervisionWrapper
 from nnunetv2.training.loss.dice import get_tp_fp_fn_tn, MemoryEfficientSoftDiceLoss
@@ -74,7 +76,7 @@ from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
 
 
 
-class DANNTrainer2(nnUNetTrainer):
+class caseby_Decoder_DANNTrainer(nnUNetTrainer):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict, unpack_dataset: bool = True,
                  device: torch.device = torch.device('cuda')):
         # From https://grugbrain.dev/. Worth a read ya big brains ;-)
@@ -150,7 +152,7 @@ class DANNTrainer2(nnUNetTrainer):
                 if self.is_cascaded else None
 
         ### Some hyperparameters for you to fiddle with
-        self.s_initial_lr = 5e-3
+        self.s_initial_lr = 1e-2
         self.d_initial_lr = 1e-4
         self.weight_decay = 3e-5
         self.oversample_foreground_percent = 0.33
@@ -170,9 +172,14 @@ class DANNTrainer2(nnUNetTrainer):
         #self.optimizer = self.lr_scheduler = None  # -> self.initialize
         self.s_optimizer = self.s_lr_scheduler = None
         self.d_optimizer = self.d_lr_scheduler = None
-        self.f_optimizer = self.f_lr_scheduler = None
         
-        self.grad_scaler = GradScaler() if self.device.type == 'cuda' else None
+        #self.s_grad_scaler = GradScaler() if self.device.type == 'cuda' else None
+        #self.d_grad_scaler = GradScaler() if self.device.type == 'cuda' else None
+        #self.f_grad_scaler = GradScaler() if self.device.type == 'cuda' else None
+
+        self.s_grad_scaler = None
+        self.d_grad_scaler = None
+        self.f_grad_scaler = None
 
         self.loss = None  # -> self.initialize
         self.log_data = {'segmentation_loss':[], 'discriminator_loss' : []}
@@ -184,8 +191,7 @@ class DANNTrainer2(nnUNetTrainer):
         self.log_file = join(self.output_folder, "training_log_%d_%d_%d_%02.0d_%02.0d_%02.0d.txt" %
                              (timestamp.year, timestamp.month, timestamp.day, timestamp.hour, timestamp.minute,
                               timestamp.second))
-        self.logger = nnUNetLogger()
-        self.logger.my_fantastic_logging['domain_acc'] = list()
+        self.logger = iden_DiscriminatorLogger()
         ### placeholders
         self.dataloader_train = self.dataloader_val = None  # see on_train_start
 
@@ -245,13 +251,13 @@ class DANNTrainer2(nnUNetTrainer):
             self.classifier_args = {
                 "input_size" : self.configuration_manager.patch_size,
                 "features_per_stage" : self.configuration_manager.network_arch_init_kwargs['features_per_stage'],
-                "num_domains" : 2
+                "num_domains" : 1
             }
             self.network = self.build_network_architecture(
                 self.configuration_manager.network_arch_class_name,
                 self.configuration_manager.network_arch_init_kwargs,
                 self.configuration_manager.network_arch_init_kwargs_req_import,
-                self.num_input_channels,
+                1,
                 self.label_manager.num_segmentation_heads,
                 self.enable_deep_supervision,
                 self.classifier_args
@@ -262,7 +268,7 @@ class DANNTrainer2(nnUNetTrainer):
                 self.print_to_log_file('Using torch.compile...')
                 self.network = torch.compile(self.network)
 
-            self.s_optimizer, self.s_lr_scheduler, self.d_optimizer, self.d_lr_scheduler, self.f_optimizer, self.f_lr_scheduler = self.configure_optimizers()
+            self.s_optimizer, self.s_lr_scheduler, self.d_optimizer, self.d_lr_scheduler = self.configure_optimizers()
             # if ddp, wrap in DDP wrapper
             if self.is_ddp:
                 self.network = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.network)
@@ -270,6 +276,8 @@ class DANNTrainer2(nnUNetTrainer):
 
             self.loss = self._build_loss()
             self.domain_loss = nn.CrossEntropyLoss()
+            #self.domain_loss = nn.BCEWithLogitsLoss()
+            
             # torch 2.2.2 crashes upon compiling CE loss
             # if self._do_i_compile():
             #     self.loss = torch.compile(self.loss)
@@ -375,7 +383,8 @@ class DANNTrainer2(nnUNetTrainer):
             num_input_channels,
             num_output_channels,
             allow_init=True,
-            deep_supervision=enable_deep_supervision)
+            deep_supervision=enable_deep_supervision
+            )
         network.make_classifier(**classifier_args)
         
         if hasattr(network, 'initialize'):
@@ -560,20 +569,18 @@ class DANNTrainer2(nnUNetTrainer):
 
     def configure_optimizers(self):
         #seg
-        s_optimizer = torch.optim.SGD(self.network.decoder.parameters(), self.s_initial_lr, weight_decay=self.weight_decay,
+        s_optimizer = torch.optim.SGD(list(self.network.encoder.parameters()) + list(self.network.decoder.parameters()), self.s_initial_lr, weight_decay=self.weight_decay,
                                     momentum=0.99, nesterov=True)
         #domain
-        d_optimizer = torch.optim.SGD(self.network.classifier.parameters(), self.d_initial_lr, weight_decay=self.weight_decay,
-                                    momentum=0.99, nesterov=True)
-        #feature 
-        f_optimizer = torch.optim.SGD(self.network.encoder.parameters(), self.s_initial_lr, weight_decay=self.weight_decay,
+        d_optimizer = torch.optim.SGD(list(self.network.encoder.parameters()) + list(self.network.classifier.parameters()), self.d_initial_lr, weight_decay=self.weight_decay,
                                     momentum=0.99, nesterov=True)
         
         s_lr_scheduler = PolyLRScheduler(s_optimizer, self.s_initial_lr, self.num_epochs)
-        d_lr_scheduler = PolyLRScheduler(d_optimizer, self.d_initial_lr, self.num_epochs)
-        f_lr_scheduler = PolyLRScheduler(f_optimizer, self.s_initial_lr, self.num_epochs)
+        d_lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(d_optimizer, T_0=67, T_mult=2, eta_min=(self.d_initial_lr / 20),last_epoch=-1)
+       
+        #d_lr_scheduler = PolyLRScheduler(d_optimizer, self.d_initial_lr, self.num_epochs)
         
-        return s_optimizer, s_lr_scheduler, d_optimizer, d_lr_scheduler, f_optimizer, f_lr_scheduler
+        return s_optimizer, s_lr_scheduler, d_optimizer, d_lr_scheduler
 
     def plot_network_architecture(self):
         if self._do_i_compile():
@@ -732,13 +739,13 @@ class DANNTrainer2(nnUNetTrainer):
                                         oversample_foreground_percent=self.oversample_foreground_percent,
                                         sampling_probabilities=None, pad_sides=None, transforms=val_transforms)
         else:
-            dl_tr = DANNDataLoader3D(dataset_tr, self.batch_size,
+            dl_tr = nnUNetDataLoader3D(dataset_tr, self.batch_size,
                                        initial_patch_size,
                                        self.configuration_manager.patch_size,
                                        self.label_manager,
                                        oversample_foreground_percent=self.oversample_foreground_percent,
                                        sampling_probabilities=None, pad_sides=None, transforms=tr_transforms)
-            dl_val = DANNDataLoader3D(dataset_val, self.batch_size,
+            dl_val = nnUNetDataLoader3D(dataset_val, self.batch_size,
                                         self.configuration_manager.patch_size,
                                         self.configuration_manager.patch_size,
                                         self.label_manager,
@@ -1036,24 +1043,27 @@ class DANNTrainer2(nnUNetTrainer):
         self.network.train()
         self.s_lr_scheduler.step(self.current_epoch)
         self.d_lr_scheduler.step(self.current_epoch)
-        self.f_lr_scheduler.step(self.current_epoch)
         
         self.print_to_log_file('')
         self.print_to_log_file(f'Epoch {self.current_epoch}')
         self.print_to_log_file(
-            f"Current learning rate: {np.round(self.s_optimizer.param_groups[0]['lr'], decimals=5)}")
+            f"Current segmentation learning rate: {np.round(self.s_optimizer.param_groups[0]['lr'], decimals=5)}")
+        self.print_to_log_file(
+            f"Current domain learning rate: {np.round(self.d_optimizer.param_groups[0]['lr'], decimals=6)}")
         # lrs are the same for all workers so we don't need to gather them in case of DDP training
         self.logger.log('lrs', self.s_optimizer.param_groups[0]['lr'], self.current_epoch)
+        self.logger.log('domain_lrs', self.d_optimizer.param_groups[0]['lr'], self.current_epoch)
 
     def train_step(self, batch: dict) -> dict:
         data = batch['data']
         if torch.isnan(data).any():
             print("NaN found in inputs!")
         target = batch['target']
-        domain_gt = batch['domain']
-
-        data = data.to(self.device, non_blocking=True)
-        domain_gt = domain_gt.to(self.device, non_blocking=True)
+        ncct_data = data[:, 0:1, :, :, :]  # B x 1 x D x W x H
+        cect_data = data[:, 1:2, :, :, :]  # B x 1 x D x W x H
+        
+        ncct_data = ncct_data.to(self.device, non_blocking=True)
+        cect_data = cect_data.to(self.device, non_blocking=True)
         if isinstance(target, list):
             target = [i.to(self.device, non_blocking=True) for i in target]
         else:
@@ -1065,60 +1075,106 @@ class DANNTrainer2(nnUNetTrainer):
         # If the device_type is 'cpu' then it's slow as heck and needs to be disabled.
         # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
         # So autocast will only be active if we have a cuda device.
-        with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
-            output, domain_output = self.network(data)
-            ### 내가 만든 domain 관련 log 보려면 True로 바꾸기
-            #print(domain_output)
-            #self.check_output(domain_output)
-            
-            threshold = 500
-            #clip_domain_output = torch.clamp(domain_output, -10, 10)
-            # del data
-            s_l = self.loss(output, target)
-            if torch.isnan(domain_output).any():
-                self.current_epoch += 1
-                self.check_parameter()
-                self.check_gradient()
-                print("NaN found in logits!")
-            elif torch.isinf(domain_output).any():
-                print("Inf found in logits!")
-                
-            d_l = self.domain_loss(domain_output, domain_gt)
-            #d_l = self.domain_loss(clip_domain_output, domain_gt)
-            f_l = -0.001 * d_l
-            
+        
         self.d_optimizer.zero_grad(set_to_none=True)
-        self.f_optimizer.zero_grad(set_to_none=True)
         self.s_optimizer.zero_grad(set_to_none=True)
         
-        if self.grad_scaler is not None:
-            self.grad_scaler.scale(d_l).backward(retain_graph=True)
-            self.grad_scaler.unscale_(self.d_optimizer)
-            self.grad_scaler.scale(f_l).backward(retain_graph=True)
-            self.grad_scaler.unscale_(self.f_optimizer)
-            self.grad_scaler.scale(s_l).backward()
-            self.grad_scaler.unscale_(self.s_optimizer)
+        with autocast(self.device.type, enabled=True) if 0 else dummy_context():
+        #with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
+            ncct_output, ncct_domain_output = self.network(ncct_data)
+            cect_output, cect_domain_output = self.network(cect_data)
+            
+            ncct_s_l = self.loss(ncct_output, target)
+            cect_s_l = self.loss(cect_output, target)
+            s_l = ncct_s_l + cect_s_l
+            #if torch.isnan(domain_output).any():
+            #    self.current_epoch += 1
+            #    self.check_parameter()
+            #    self.check_gradient()
+            #    print("NaN found in logits!")
+            #elif torch.isinf(domain_output).any():
+            #    print("Inf found in logits!")
+
+        
+            domain_output = torch.cat((ncct_domain_output, cect_domain_output), dim=1)
+            domain_gt = torch.ones(domain_output.size(0), dtype=torch.long)
+            domain_gt = domain_gt.to(self.device, non_blocking=True)
+            d_l = self.domain_loss(domain_output, domain_gt)
+            #d_l = self.domain_loss(clip_domain_output, domain_gt)
+        #print(s_l)
+        #print(d_l)
+        #print(f_l)
+        
+        d_l.backward(retain_graph=True)
+        s_l.backward(retain_graph=True)
+        torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+        self.d_optimizer.step()
+        self.s_optimizer.step()
+        
+        """
+        self.f_optimizer.zero_grad(set_to_none=True)
+        
+        if self.f_grad_scaler is not None:
+            self.f_grad_scaler.scale(f_l).backward(retain_graph=True)
+            self.f_grad_scaler.unscale_(self.f_optimizer)
+        else:
+            (f_l).backward(retain_graph=True)
+            #(d_l).backward(retain_graph=True)
+        torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+        
+        if self.f_grad_scaler is not None:
+            self.f_grad_scaler.step(self.f_optimizer)
+            self.f_grad_scaler.update()
+        else:
+            self.f_optimizer.step()
+        # 파라미터에서 NaN 확인
+        for name, param in self.network.named_parameters():
+            if torch.isnan(param).any():
+                print(f"NaN detected in parameter: {name}")
+        self.d_optimizer.zero_grad(set_to_none=True)
+        
+        if self.d_grad_scaler is not None:
+            self.d_grad_scaler.scale(d_l).backward(retain_graph=True)
+            self.d_grad_scaler.unscale_(self.d_optimizer)
         else:
             d_l.backward(retain_graph=True)
-            f_l.backward(retain_graph=True)
+        
+        torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+
+        if self.d_grad_scaler is not None:
+            self.d_grad_scaler.step(self.d_optimizer)
+            self.d_grad_scaler.update()
+        else:
+            self.d_optimizer.step()
+        #print("통과2")
+        # 파라미터에서 NaN 확인
+        #for name, param in self.network.named_parameters():
+        #    if torch.isnan(param).any():
+        #        print(f"NaN detected in parameter: {name}")
+        self.s_optimizer.zero_grad(set_to_none=True)
+
+        if self.s_grad_scaler is not None:
+            self.s_grad_scaler.scale(s_l).backward()
+            self.s_grad_scaler.unscale_(self.s_optimizer)
+        else:
             s_l.backward()
         
         torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
 
-        if self.grad_scaler is not None:
-            self.grad_scaler.step(self.d_optimizer)
-            self.grad_scaler.update()
-            self.grad_scaler.step(self.f_optimizer)
-            self.grad_scaler.update()
-            self.grad_scaler.step(self.s_optimizer)
-            self.grad_scaler.update()
+        if self.s_grad_scaler is not None:
+            self.s_grad_scaler.step(self.s_optimizer)
+            self.s_grad_scaler.update()
         else:
-            self.d_optimizer.step()
-            self.f_optimizer.step()
             self.s_optimizer.step()
-        
-        for p in self.network.classifier.parameters():
-            p.data.clamp_(-2.0, 2.0)
+        #print("통과3")
+        # 파라미터에서 NaN 확인
+        for name, param in self.network.named_parameters():
+            if torch.isnan(param).any():
+                print(f"NaN detected in parameter: {name}")
+            #else:
+            #    print(f"Good param : {name}")
+        #for p in self.network.classifier.parameters():
+        #    p.data.clamp_(-2.0, 2.0)
 
         if print_log:
             for name, param in self.network.named_parameters():
@@ -1134,16 +1190,15 @@ class DANNTrainer2(nnUNetTrainer):
             self.log_data['segmentation_loss'].append(s_l.detach().item())
             self.log_data['discriminator_loss'].append(d_l.detach().item())
             save_json(self.log_data, join("/home/ubuntu/seongwoo/log", "DANN_weight.json"), sort_keys=False)
-        
-        result_s_l = s_l.detach()
+        """
+        result_s_l = ncct_s_l.detach()
         result_d_l = d_l.detach()
-        f_l.detach()
+
         if print_log:
             self.loss_log['s_l'].append(result_s_l.item())
             self.loss_log['d_l'].append(result_d_l.item())
         
             save_json(self.loss_log, join("/home/ubuntu/seongwoo/log", "DANN_log.json"), sort_keys=False)
-            
         return {'loss': result_s_l.cpu().numpy(), 'domain_loss': result_d_l.cpu().numpy()}
 
     def on_train_epoch_end(self, train_outputs: List[dict]):
@@ -1159,34 +1214,47 @@ class DANNTrainer2(nnUNetTrainer):
             losses_tr = [None for _ in range(dist.get_world_size())]
             dist.all_gather_object(losses_tr, outputs['loss'])
             loss_here = np.vstack(losses_tr).mean()
+            domain_losses_tr = [None for _ in range(dist.get_world_size())]
+            dist.all_gather_object(domain_losses_tr, outputs['domain_loss'])
+            domain_loss_here = np.vstack(domain_losses_tr).mean()
         else:
             loss_here = np.mean(outputs['loss'])
+            domain_loss_here = np.mean(outputs['domain_loss'])
 
         self.logger.log('train_losses', loss_here, self.current_epoch)
+        self.logger.log('class_train_losses', domain_loss_here, self.current_epoch)
 
     def on_validation_epoch_start(self):
         self.network.eval()
 
     def validation_step(self, batch: dict) -> dict:
         data = batch['data']
+        ncct_data = data[:, 0:1, :, :, :]
+        cect_data = data[:, 1:2, :, :, :]
+        
         target = batch['target']
-        domain_gt = batch['domain']
-
-        data = data.to(self.device, non_blocking=True)
+        
+        ncct_data = ncct_data.to(self.device, non_blocking=True)
+        cect_data = cect_data.to(self.device, non_blocking=True)
+        
         if isinstance(target, list):
             target = [i.to(self.device, non_blocking=True) for i in target]
         else:
             target = target.to(self.device, non_blocking=True)
-
-        # Autocast can be annoying
-        # If the device_type is 'cpu' then it's slow as heck and needs to be disabled.
-        # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
-        # So autocast will only be active if we have a cuda device.
+        
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
-            output, domain_output = self.network(data)
-            del data
+            output, ncct_domain_output = self.network(ncct_data)
+            _, cect_domain_output = self.network(cect_data)
+            del ncct_data
+            del cect_data
+            
             l = self.loss(output, target)
             
+            domain_output = torch.cat((ncct_domain_output, cect_domain_output), dim=1)
+            domain_gt = torch.ones(domain_output.size(0), dtype=torch.long)
+            domain_gt = domain_gt.to(self.device, non_blocking=True)
+        
+            d_l = self.domain_loss(domain_output, domain_gt)
             
         # we only need the output with the highest output resolution (if DS enabled)
         if self.enable_deep_supervision:
@@ -1243,7 +1311,7 @@ class DANNTrainer2(nnUNetTrainer):
             fp_hard = fp_hard[1:]
             fn_hard = fn_hard[1:]
 
-        return {'loss': l.detach().cpu().numpy(), 'tp_hard': tp_hard, 'fp_hard': fp_hard, 'fn_hard': fn_hard, 'domain_t' : domain_t, 'domain_f' : domain_f}
+        return {'loss': l.detach().cpu().numpy(), 'tp_hard': tp_hard, 'fp_hard': fp_hard, 'fn_hard': fn_hard, 'domain_t' : domain_t, 'domain_f' : domain_f, 'domain_loss' : d_l.detach().cpu().numpy()}
 
     def on_validation_epoch_end(self, val_outputs: List[dict]):
         outputs_collated = collate_outputs(val_outputs)
@@ -1273,8 +1341,12 @@ class DANNTrainer2(nnUNetTrainer):
             losses_val = [None for _ in range(world_size)]
             dist.all_gather_object(losses_val, outputs_collated['loss'])
             loss_here = np.vstack(losses_val).mean()
+            domain_losses_val = [None for _ in range(world_size)]
+            dist.all_gather_object(domain_losses_val, outputs_collated['domain_loss'])
+            domain_loss_here = np.vstack(domain_losses_val).mean()
         else:
             loss_here = np.mean(outputs_collated['loss'])
+            domain_loss_here = np.mean(outputs_collated['domain_loss'])
 
         global_dc_per_class = [i for i in [2 * i / (2 * i + j + k) for i, j, k in zip(tp, fp, fn)]]
         mean_fg_dice = np.nanmean(global_dc_per_class)
@@ -1282,6 +1354,7 @@ class DANNTrainer2(nnUNetTrainer):
         self.logger.log('domain_acc', domain_acc, self.current_epoch)
         self.logger.log('dice_per_class_or_region', global_dc_per_class, self.current_epoch)
         self.logger.log('val_losses', loss_here, self.current_epoch)
+        self.logger.log('class_val_losses', domain_loss_here, self.current_epoch)
 
     def on_epoch_start(self):
         self.logger.log('epoch_start_timestamps', time(), self.current_epoch)
@@ -1295,6 +1368,7 @@ class DANNTrainer2(nnUNetTrainer):
 
         self.print_to_log_file('train_loss', np.round(self.logger.my_fantastic_logging['train_losses'][-1], decimals=4))
         self.print_to_log_file('val_loss', np.round(self.logger.my_fantastic_logging['val_losses'][-1], decimals=4))
+        self.print_to_log_file('class_val_loss', np.round(self.logger.my_fantastic_logging['class_val_losses'][-1], decimals=4))
         self.print_to_log_file('Pseudo dice', [np.round(i, decimals=4) for i in
                                                self.logger.my_fantastic_logging['dice_per_class_or_region'][-1]])
         self.print_to_log_file(
@@ -1332,8 +1406,8 @@ class DANNTrainer2(nnUNetTrainer):
                     'network_weights': mod.state_dict(),
                     's_optimizer_state': self.s_optimizer.state_dict(),
                     'd_optimizer_state': self.d_optimizer.state_dict(),
-                    'f_optimizer_state': self.f_optimizer.state_dict(),
-                    'grad_scaler_state': self.grad_scaler.state_dict() if self.grad_scaler is not None else None,
+                    's_grad_scaler_state': self.s_grad_scaler.state_dict() if self.s_grad_scaler is not None else None,
+                    'd_grad_scaler_state': self.d_grad_scaler.state_dict() if self.d_grad_scaler is not None else None,
                     'logging': self.logger.get_checkpoint(),
                     '_best_ema': self._best_ema,
                     'current_epoch': self.current_epoch + 1,
@@ -1350,7 +1424,7 @@ class DANNTrainer2(nnUNetTrainer):
             self.initialize()
 
         if isinstance(filename_or_checkpoint, str):
-            checkpoint = torch.load(filename_or_checkpoint, map_location=self.device)
+            checkpoint = torch.load(filename_or_checkpoint, map_location=self.device, weights_only=False)
         # if state dict comes from nn.DataParallel but we use non-parallel model here then the state dict keys do not
         # match. Use heuristic to make it match
         new_state_dict = {}
@@ -1380,11 +1454,14 @@ class DANNTrainer2(nnUNetTrainer):
                 self.network.load_state_dict(new_state_dict)
         self.s_optimizer.load_state_dict(checkpoint['s_optimizer_state'])
         self.d_optimizer.load_state_dict(checkpoint['d_optimizer_state'])
-        self.f_optimizer.load_state_dict(checkpoint['f_optimizer_state'])
         
-        if self.grad_scaler is not None:
-            if checkpoint['grad_scaler_state'] is not None:
-                self.grad_scaler.load_state_dict(checkpoint['grad_scaler_state'])
+        
+        if self.s_grad_scaler is not None:
+            if checkpoint['s_grad_scaler_state'] is not None:
+                self.s_grad_scaler.load_state_dict(checkpoint['s_grad_scaler_state'])
+        if self.d_grad_scaler is not None:
+            if checkpoint['d_grad_scaler_state'] is not None:
+                self.d_grad_scaler.load_state_dict(checkpoint['d_grad_scaler_state'])
 
 
     def perform_actual_validation(self, save_probabilities: bool = False):
@@ -1401,7 +1478,7 @@ class DANNTrainer2(nnUNetTrainer):
                                    "forward pass (where compile is triggered) already has deep supervision disabled. "
                                    "This is exactly what we need in perform_actual_validation")
 
-        predictor = nnUNetPredictor(tile_step_size=0.5, use_gaussian=True, use_mirroring=True,
+        predictor = CasePredictor(tile_step_size=0.5, use_gaussian=True, use_mirroring=True,
                                     perform_everything_on_device=True, device=self.device, verbose=False,
                                     verbose_preprocessing=False, allow_tqdm=False)
         predictor.manual_initialization(self.network, self.plans_manager, self.configuration_manager, None,

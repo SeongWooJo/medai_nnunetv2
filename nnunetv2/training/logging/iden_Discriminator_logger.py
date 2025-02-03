@@ -26,6 +26,7 @@ class iden_DiscriminatorLogger(object):
             'class_train_losses': list(),
             'class_val_losses': list(),
             'lrs': list(),
+            'domain_lrs' : list(),
             'epoch_start_timestamps': list(),
             'epoch_end_timestamps': list()
         }
@@ -110,10 +111,16 @@ class iden_DiscriminatorLogger(object):
 
         # learning rate
         ax = ax_all[3]
-        ax.plot(x_values, self.my_fantastic_logging['lrs'][:epoch + 1], color='b', ls='-', label="learning rate", linewidth=4)
+        ax2 = ax.twinx()
+        ax.plot(x_values, self.my_fantastic_logging['lrs'][:epoch + 1], color='b', ls='-', label="seg_learning rate", linewidth=4)
+        ax2.plot(x_values, self.my_fantastic_logging['domain_lrs'][:epoch + 1], color='r', ls='-', label="domain_learning rate", linewidth=4)
+        
         ax.set_xlabel("epoch")
         ax.set_ylabel("learning rate")
+        ax2.set_ylabel("domain learning rate")
+        
         ax.legend(loc=(0, 1))
+        ax2.legend(loc=(0.2, 1))
 
         plt.tight_layout()
 

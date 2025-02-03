@@ -70,7 +70,7 @@ from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
 # MyCustomTrainer.py 파일로 저장
 from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
 from torch.utils.tensorboard import SummaryWriter
-class pretrained_all_DiscriminatorTrainer(nnUNetTrainer):
+class newlr_all_DiscriminatorTrainer(nnUNetTrainer):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict, unpack_dataset: bool = True,
                  device: torch.device = torch.device('cuda')):
         # From https://grugbrain.dev/. Worth a read ya big brains ;-)
@@ -563,7 +563,7 @@ class pretrained_all_DiscriminatorTrainer(nnUNetTrainer):
         optimizer = torch.optim.SGD(self.network.classifier.parameters(), self.initial_lr, weight_decay=self.weight_decay,
                                     momentum=0.99, nesterov=True)
         #lr_scheduler = PolyLRScheduler(optimizer, self.initial_lr, self.num_epochs)
-        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=63, T_mult=2, eta_min=self.initial_lr / 20, lr=self.initial_lr,last_epoch=self.num_epochs)
+        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=63, T_mult=2, eta_min=(self.initial_lr / 20),last_epoch=-1)
         
 
         return optimizer, lr_scheduler
