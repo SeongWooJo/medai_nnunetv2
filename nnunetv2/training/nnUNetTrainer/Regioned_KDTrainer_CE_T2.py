@@ -1067,10 +1067,10 @@ class Regioned_KDTrainer_CE_T2(nnUNetTrainer):
         with autocast(self.device.type, enabled=True) if 0 else dummy_context():
             # Forward pass with the teacher model - do not save gradients here as we do not change the teacher's weights
             with torch.no_grad():
-                teacher_output, teacher_feature = self.teacher_network(data_1)           # CECT
+                teacher_output = self.teacher_network(data_1)           # CECT
             
             # Forward pass with the student model
-            student_output, student_feature = self.network(data_0)                       # NCCT
+            student_output = self.network(data_0)                       # NCCT
             
             mask_list = []
             for target_elem in target:
@@ -1146,7 +1146,7 @@ class Regioned_KDTrainer_CE_T2(nnUNetTrainer):
         # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
         # So autocast will only be active if we have a cuda device.
         with autocast(self.device.type, enabled=True) if 0 else dummy_context():
-            output, _ = self.network(data)
+            output = self.network(data)
             del data
             l = self.loss(output, target)
 
