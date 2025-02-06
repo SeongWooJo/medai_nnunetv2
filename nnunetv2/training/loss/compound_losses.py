@@ -154,3 +154,70 @@ class DC_and_topk_loss(nn.Module):
 
         result = self.weight_ce * ce_loss + self.weight_dice * dc_loss
         return result
+
+class KD_MSE_loss(nn.Module):
+    def __init__(self, reduction = 'mean', softmax = False, temperature = 2):
+        super(KD_MSE_loss, self).__init__()
+        
+        self.reduction = reduction
+        self.softmax = softmax
+        self.temperature = temperature
+        self.mse_loss = nn.MSELoss(reduction=reduction)
+        
+    def forward(self, net_output: torch.Tensor, target: torch.Tensor):
+
+        softmax = self.softmax
+        T = self.temperature
+
+        teacher_output = target
+        student_output = net_output
+        
+        if softmax:
+            teacher_output = nn.functional.softmax(target/T, dim=1)
+            student_output = nn.functional.softmax(net_output/T, dim=1)
+            result = self.mse_loss(student_output, teacher_output) * (T**2)
+
+        else:
+            result = self.mse_loss(student_output/T, teacher_output/T)
+        
+        # Check the loss
+        return result
+
+class KD_KLDiv_loss(nn.Module):
+    def __init__(self, reduction  = 'mean', temperature = 2):
+        super(KD_KLDiv_loss, self).__init__()
+        
+        self.reduction = reduction
+        self.temperature = temperature
+        self.kldiv_loss = nn.KLDivLoss(reduction=reduction, log_target=True)
+
+    def forward(self, net_output: torch.Tensor, target: torch.Tensor):
+        T = self.temperature
+
+        teacher_output = nn.functional.log_softmax(target/T, dim=1)
+        student_output = nn.functional.log_softmax(net_output/T, dim=1)
+        
+        result = self.kldiv_loss(student_output, teacher_output) * (T**2)
+
+        # Check the loss
+        return result
+    
+class KD_CE_loss(nn.Module):
+    def __init__(self, reduction = 'mean', temperature = 2):
+        super(KD_CE_loss, self).__init__()
+        
+        self.reduction = reduction
+        self.temperature = temperature
+        self.ce_loss = nn.CrossEntropyLoss(reduction=reduction)
+
+    def forward(self, net_output: torch.Tensor, target: torch.Tensor):
+        T = self.temperature
+
+        teacher_output = nn.functional.softmax(target/T, dim=1)
+        student_output = net_output/T
+        
+        result = self.ce_loss(student_output, teacher_output) * (T**2)
+
+        # Check the loss
+        return result
+

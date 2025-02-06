@@ -296,8 +296,8 @@ class caseby_DCGAN_R3GANTrainer(nnUNetTrainer):
                 'max_epoch': self.num_epochs
             }
             self.gamma_scheduler = adversarial_losses.cosine_decay_with_warmup
-            #self.domain_loss = adversarial_losses.AccumulateDiscriminatorGradients
-            self.domain_loss = adversarial_losses.SimpleDiscriminatorGradients
+            self.domain_loss = adversarial_losses.AccumulateDiscriminatorGradients
+            #self.domain_loss = adversarial_losses.SimpleDiscriminatorGradients
             self.adv_domain_loss = adversarial_losses.AccumulateGeneratorGradients
             #self.domain_loss = nn.BCEWithLogitsLoss()
             
@@ -1102,6 +1102,7 @@ class caseby_DCGAN_R3GANTrainer(nnUNetTrainer):
 
     def on_train_epoch_start(self):
         self.network.train()
+        self.only_encoder_network.eval()
         self.s_lr_scheduler.step(self.current_epoch)
         self.d_lr_scheduler.step(self.current_epoch)
         
@@ -1117,14 +1118,10 @@ class caseby_DCGAN_R3GANTrainer(nnUNetTrainer):
 
     def train_step(self, batch: dict) -> dict:
         data = batch['data']
+        data = data.to(self.device, non_blocking=True)
         ncct_data = data[:, 0:1, :, :, :]  # B x 1 x D x W x H
         cect_data = data[:, 1:2, :, :, :]  # B x 1 x D x W x H
-        if torch.isnan(data).any():
-            print("NaN found in inputs!")
         target = batch['target']
-
-        ncct_data = ncct_data.to(self.device, non_blocking=True)
-        cect_data = cect_data.to(self.device, non_blocking=True)
         
         if isinstance(target, list):
             target = [i.to(self.device, non_blocking=True) for i in target]
@@ -1143,11 +1140,16 @@ class caseby_DCGAN_R3GANTrainer(nnUNetTrainer):
         
         with autocast(self.device.type, enabled=True) if 0 else dummy_context():
             cect_domain_skips = self.only_encoder_network(cect_data)
-            ncct_output, ncct_domain_output_list = self.network(ncct_data)
+            ncct_domain_skips = self.network.encoder(ncct_data)
+            ncct_output = self.network.decoder(ncct_domain_skips)
+            ncct_domain_output_list = []
+            #ncct_output, ncct_domain_output_list = self.network(ncct_data)
             cect_domain_output_list = []
             for idx, block in enumerate(self.network.classifier_list):
+                ncct_domain_output_list.append(block(ncct_domain_skips[idx]))
                 cect_domain_output_list.append(block(cect_domain_skips[idx]))
             
+
             ncct_s_l = self.loss(ncct_output, target)
 
             ncct_domain_output = torch.stack(ncct_domain_output_list).mean(dim=0)
@@ -1156,16 +1158,19 @@ class caseby_DCGAN_R3GANTrainer(nnUNetTrainer):
             #cect_s_l = self.loss(cect_output, target)
             s_l = ncct_s_l
 
-            d_l, RelativisticLogits = self.domain_loss(ncct_domain_output, cect_domain_output)
+            #d_l, RelativisticLogits = self.domain_loss(ncct_domain_output, cect_domain_output)
+            gamma = self.gamma_scheduler(self.current_epoch, **self.gamma_scheduler_kwargs)
+            d_l, RelativisticLogits, R1Penalty, R2Penalty = self.domain_loss(ncct_domain_skips, cect_domain_skips, ncct_domain_output, cect_domain_output, gamma)
+            #print(d_l)
             adv_d_l, _ = self.adv_domain_loss(ncct_domain_output, cect_domain_output)
-            adv_d_l = adv_d_l - d_l + s_l
+            adv_d_l = adv_d_l - d_l
         #adv_d_l에 -d_l을 해주는 이유는 계산 그래프상 겹쳐버리기 때문에 겹치는 영역의 grad를 없애주기 위해
         adv_d_l.backward(retain_graph=True)
         self.d_optimizer.zero_grad(set_to_none=True)
         d_l.backward(retain_graph=True)
-        #s_l.backward()
+        s_l.backward()
         
-        torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+        #torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
         
         self.d_optimizer.step()
         self.s_optimizer.step()
@@ -1207,18 +1212,15 @@ class caseby_DCGAN_R3GANTrainer(nnUNetTrainer):
         self.logger.log('class_train_losses', domain_loss_here, self.current_epoch)
 
     def on_validation_epoch_start(self):
-        self.network.eval()
+        self.network.train()
 
     def validation_step(self, batch: dict) -> dict:
         data = batch['data']
-        ncct_data = data[:, 0:1, :, :, :]
-        cect_data = data[:, 1:2, :, :, :]
-        
+        data = data.to(self.device, non_blocking=True)
+        ncct_data = data[:, 0:1, :, :, :]  # B x 1 x D x W x H
+        cect_data = data[:, 1:2, :, :, :]  # B x 1 x D x W x H
         
         target = batch['target']
-        
-        ncct_data = ncct_data.to(self.device, non_blocking=True)
-        cect_data = cect_data.to(self.device, non_blocking=True)
         
         if isinstance(target, list):
             target = [i.to(self.device, non_blocking=True) for i in target]
@@ -1232,9 +1234,14 @@ class caseby_DCGAN_R3GANTrainer(nnUNetTrainer):
         # So autocast will only be active if we have a cuda device.
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
             cect_domain_skips = self.only_encoder_network(cect_data)
-            output, ncct_domain_output_list = self.network(ncct_data)
+            ncct_domain_skips = self.network.encoder(ncct_data)
+            output = self.network.decoder(ncct_domain_skips)
+    
+            #output, ncct_domain_output_list = self.network(ncct_data)
+            ncct_domain_output_list = []
             cect_domain_output_list = []
             for idx, block in enumerate(self.network.classifier_list):
+                ncct_domain_output_list.append(block(ncct_domain_skips[idx]))
                 cect_domain_output_list.append(block(cect_domain_skips[idx]))
             del ncct_data
             del cect_data
@@ -1244,9 +1251,9 @@ class caseby_DCGAN_R3GANTrainer(nnUNetTrainer):
             ncct_domain_output = torch.stack(ncct_domain_output_list).mean(dim=0)
             cect_domain_output = torch.stack(cect_domain_output_list).mean(dim=0)
             
-            #gamma = self.gamma_scheduler(self.current_epoch, **self.gamma_scheduler_kwargs)
-            #d_l, RelativisticLogits, R1Penalty, R2Penalty = self.domain_loss(ncct_data, cect_data, ncct_domain_output, cect_domain_output, gamma)
-            d_l, RelativisticLogits = self.domain_loss(ncct_domain_output, cect_domain_output)
+            gamma = self.gamma_scheduler(self.current_epoch, **self.gamma_scheduler_kwargs)
+            d_l, RelativisticLogits, R1Penalty, R2Penalty = self.domain_loss(ncct_domain_skips, cect_domain_skips, ncct_domain_output, cect_domain_output, gamma)
+            #d_l, RelativisticLogits = self.domain_loss(ncct_domain_output, cect_domain_output)
             
         # we only need the output with the highest output resolution (if DS enabled)
         if self.enable_deep_supervision:
@@ -1415,7 +1422,7 @@ class caseby_DCGAN_R3GANTrainer(nnUNetTrainer):
             self.initialize()
 
         if isinstance(filename_or_checkpoint, str):
-            checkpoint = torch.load(filename_or_checkpoint, map_location=self.device)
+            checkpoint = torch.load(filename_or_checkpoint, map_location=self.device, weights_only=False)
         # if state dict comes from nn.DataParallel but we use non-parallel model here then the state dict keys do not
         # match. Use heuristic to make it match
         new_state_dict = {}
@@ -1611,12 +1618,12 @@ class caseby_DCGAN_R3GANTrainer(nnUNetTrainer):
                 train_outputs.append(self.train_step(next(self.dataloader_train)))
             self.on_train_epoch_end(train_outputs)
 
-            with torch.no_grad():
-                self.on_validation_epoch_start()
-                val_outputs = []
-                for batch_id in range(self.num_val_iterations_per_epoch):
-                    val_outputs.append(self.validation_step(next(self.dataloader_val)))
-                self.on_validation_epoch_end(val_outputs)
+            #with torch.no_grad():
+            self.on_validation_epoch_start()
+            val_outputs = []
+            for batch_id in range(self.num_val_iterations_per_epoch):
+                val_outputs.append(self.validation_step(next(self.dataloader_val)))
+            self.on_validation_epoch_end(val_outputs)
 
             self.on_epoch_end()
 

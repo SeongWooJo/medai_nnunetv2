@@ -67,6 +67,7 @@ from nnunetv2.utilities.collate_outputs import collate_outputs
 from nnunetv2.utilities.crossval_split import generate_crossval_split
 from nnunetv2.utilities.default_n_proc_DA import get_allowed_n_proc_DA
 from nnunetv2.utilities.file_path_utilities import check_workers_alive_and_busy
+from nnunetv2.utilities.get_iden_network_from_plans import get_iden_network_from_plans
 from nnunetv2.utilities.get_network_from_plans import get_network_from_plans
 from nnunetv2.utilities.helpers import empty_cache, dummy_context
 from nnunetv2.utilities.label_handling.label_handling import convert_labelmap_to_one_hot, determine_num_input_channels
@@ -78,7 +79,7 @@ from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
 
 
 
-class caseby_Decoder_R3GANTrainer2(nnUNetTrainer):
+class caseby_step_R3GANTrainer(nnUNetTrainer):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict, unpack_dataset: bool = True,
                  device: torch.device = torch.device('cuda')):
         # From https://grugbrain.dev/. Worth a read ya big brains ;-)
@@ -130,8 +131,7 @@ class caseby_Decoder_R3GANTrainer2(nnUNetTrainer):
         self.dataset_json = dataset_json
         self.fold = fold
         self.unpack_dataset = unpack_dataset
-        self.count = 0
-        self.before_time = None
+
         ### Setting all the folder names. We need to make sure things don't crash in case we are just running
         # inference and some of the folders may not be defined!
         self.preprocessed_dataset_folder_base = join(nnUNet_preprocessed, self.plans_manager.dataset_name) \
@@ -175,16 +175,18 @@ class caseby_Decoder_R3GANTrainer2(nnUNetTrainer):
         #self.optimizer = self.lr_scheduler = None  # -> self.initialize
         self.s_optimizer = self.s_lr_scheduler = None
         self.d_optimizer = self.d_lr_scheduler = None
-
+        self.g_optimizer = self.g_lr_scheduler = None
         
-        
-        self.s_grad_scaler = GradScaler() if self.device.type == 'cuda' else None
-        self.d_grad_scaler = GradScaler() if self.device.type == 'cuda' else None
+        #self.s_grad_scaler = GradScaler() if self.device.type == 'cuda' else None
+        #self.d_grad_scaler = GradScaler() if self.device.type == 'cuda' else None
+        #self.f_grad_scaler = GradScaler() if self.device.type == 'cuda' else None
 
-        #self.s_grad_scaler = None
-        #self.d_grad_scaler = None
+        self.s_grad_scaler = None
+        self.d_grad_scaler = None
+        self.f_grad_scaler = None
 
         self.loss = None  # -> self.initialize
+        self.log_data = {'segmentation_loss':[], 'discriminator_loss' : []}
         ### Simple logging. Don't take that away from me!
         # initialize log file. This is just our log for the print statements etc. Not to be confused with lightning
         # logging
@@ -280,7 +282,7 @@ class caseby_Decoder_R3GANTrainer2(nnUNetTrainer):
                 self.network = torch.compile(self.network)
                 self.only_encoder_network = torch.compile(self.only_encoder_network)
 
-            self.s_optimizer, self.s_lr_scheduler, self.d_optimizer, self.d_lr_scheduler = self.configure_optimizers()
+            self.s_optimizer, self.s_lr_scheduler, self.d_optimizer, self.d_lr_scheduler, self.g_optimizer, self.g_lr_scheduler = self.configure_optimizers()
             # if ddp, wrap in DDP wrapper
             if self.is_ddp:
                 self.network = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.network)
@@ -295,8 +297,8 @@ class caseby_Decoder_R3GANTrainer2(nnUNetTrainer):
                 'max_epoch': self.num_epochs
             }
             self.gamma_scheduler = adversarial_losses.cosine_decay_with_warmup
-            #self.domain_loss = adversarial_losses.AccumulateDiscriminatorGradients
-            self.domain_loss = adversarial_losses.SimpleDiscriminatorGradients
+            self.domain_loss = adversarial_losses.AccumulateDiscriminatorGradients
+            self.simple_domain_loss = adversarial_losses.SimpleDiscriminatorGradients
             self.adv_domain_loss = adversarial_losses.AccumulateGeneratorGradients
             #self.domain_loss = nn.BCEWithLogitsLoss()
             
@@ -307,6 +309,7 @@ class caseby_Decoder_R3GANTrainer2(nnUNetTrainer):
         else:
             raise RuntimeError("You have called self.initialize even though the trainer was already initialized. "
                                "That should not happen.")
+
 
     def _do_i_compile(self):
         # new default: compile is enabled!
@@ -378,7 +381,8 @@ class caseby_Decoder_R3GANTrainer2(nnUNetTrainer):
                                    num_input_channels: int,
                                    num_output_channels: int,
                                    enable_deep_supervision: bool = True,
-                                   classifier_args: dict = None) -> nn.Module:
+                                   classifier_args: dict = None,
+                                   input_class : int = 1) -> nn.Module:
         """
         This is where you build the architecture according to the plans. There is no obligation to use
         get_network_from_plans, this is just a utility we use for the nnU-Net default architectures. You can do what
@@ -398,17 +402,16 @@ class caseby_Decoder_R3GANTrainer2(nnUNetTrainer):
         should be generated. label_manager takes care of all that for you.)
 
         """
-        network = get_network_from_plans(
+        network = get_iden_network_from_plans(
             architecture_class_name,
             arch_init_kwargs,
             arch_init_kwargs_req_import,
             num_input_channels,
             num_output_channels,
             allow_init=True,
-            deep_supervision=enable_deep_supervision
-            )
+            deep_supervision=enable_deep_supervision,
+            input_class=input_class)
         network.make_classifier(**classifier_args)
-        network.use_grl(False)
         
         if hasattr(network, 'initialize'):
             network.apply(network.initialize)
@@ -631,16 +634,22 @@ class caseby_Decoder_R3GANTrainer2(nnUNetTrainer):
         s_optimizer = torch.optim.SGD(list(self.network.encoder.parameters()) + list(self.network.decoder.parameters()), self.s_initial_lr, weight_decay=self.weight_decay,
                                     momentum=0.99, nesterov=True)
         #domain
-        d_optimizer = torch.optim.SGD(list(self.network.classifier.parameters()), self.d_initial_lr, weight_decay=self.weight_decay,
-                                    momentum=0.99, nesterov=True)
+        d_optimizer = torch.optim.SGD(self.network.classifier.parameters(), self.d_initial_lr)
         
-
+        g_optimizer = torch.optim.SGD(self.network.encoder.parameters(), self.d_initial_lr)
+        #d_optimizer = torch.optim.SGD(self.network.classifier.parameters(), self.d_initial_lr, weight_decay=self.weight_decay,
+        #                            momentum=0.99, nesterov=True)
+        
+        #g_optimizer = torch.optim.SGD(self.network.encoder.parameters(), self.d_initial_lr, weight_decay=self.weight_decay,
+        #                            momentum=0.99, nesterov=True)
+        
         s_lr_scheduler = PolyLRScheduler(s_optimizer, self.s_initial_lr, self.num_epochs)
         d_lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(d_optimizer, T_0=67, T_mult=2, eta_min=(self.d_initial_lr / 20),last_epoch=-1)
-
+        g_lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(g_optimizer, T_0=67, T_mult=2, eta_min=(self.d_initial_lr / 20),last_epoch=-1)
+        
         #d_lr_scheduler = PolyLRScheduler(d_optimizer, self.d_initial_lr, self.num_epochs)
         
-        return s_optimizer, s_lr_scheduler, d_optimizer, d_lr_scheduler
+        return s_optimizer, s_lr_scheduler, d_optimizer, d_lr_scheduler, g_optimizer, g_lr_scheduler
 
     def plot_network_architecture(self):
         if self._do_i_compile():
@@ -1035,7 +1044,7 @@ class caseby_Decoder_R3GANTrainer2(nnUNetTrainer):
         # dataloaders must be instantiated here (instead of __init__) because they need access to the training data
         # which may not be present  when doing inference
         self.dataloader_train, self.dataloader_val = self.get_dataloaders()
-        
+
         if not self.was_initialized:
             self.initialize()
 
@@ -1104,7 +1113,8 @@ class caseby_Decoder_R3GANTrainer2(nnUNetTrainer):
         self.only_encoder_network.eval()
         self.s_lr_scheduler.step(self.current_epoch)
         self.d_lr_scheduler.step(self.current_epoch)
-        self.count = 0
+        self.g_lr_scheduler.step(self.current_epoch)
+        
         self.print_to_log_file('')
         self.print_to_log_file(f'Epoch {self.current_epoch}')
         self.print_to_log_file(
@@ -1117,105 +1127,91 @@ class caseby_Decoder_R3GANTrainer2(nnUNetTrainer):
 
     def train_step(self, batch: dict) -> dict:
         data = batch['data']
-        target = batch['target']
-
         data = data.to(self.device, non_blocking=True)
         ncct_data = data[:, 0:1, :, :, :]  # B x 1 x D x W x H
         cect_data = data[:, 1:2, :, :, :]  # B x 1 x D x W x H
-        #print(data.requires_grad)
-        #ncct_data = ncct_data.to(self.device, non_blocking=True)
-        #cect_data = cect_data.to(self.device, non_blocking=True)
+        target = batch['target']
+        
         if isinstance(target, list):
             target = [i.to(self.device, non_blocking=True) for i in target]
         else:
             target = target.to(self.device, non_blocking=True)
-        
-        #current_time = time()
-        #before_time = self.logger.my_fantastic_logging['epoch_start_timestamps'][-1]
-        #self.print_to_log_file(
-        #    f"Data upLoad time: {np.round(current_time - before_time, decimals=2)} s")
-        #before_time = current_time
 
+        print_log = False
+        
         # Autocast can be annoying
         # If the device_type is 'cpu' then it's slow as heck and needs to be disabled.
         # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
         # So autocast will only be active if we have a cuda device.
-        with autocast(self.device.type, enabled=True, dtype=torch.bfloat16) if self.device.type == 'cuda' and 0 else dummy_context():
-        #with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
-            cect_domain_skips = self.only_encoder_network(cect_data)
-            ncct_output, ncct_domain_output = self.network(ncct_data)
-            """
-            self.count = self.count + 1
-            if self.count == 27:
-                current_time = time()
-                self.before_time = self.logger.my_fantastic_logging['epoch_start_timestamps'][-1]
-                self.print_to_log_file(
-                    f"{self.count} Data excute time: {np.round(current_time - self.before_time, decimals=2)} s")
-                self.before_time = current_time
-            elif self.count % 27 == 0:
-                current_time = time()
-                self.print_to_log_file(
-                    f"{self.count} Data excute time: {np.round(current_time - self.before_time, decimals=2)} s")
-                self.before_time = current_time    
-            """
 
-            cect_domain_output = self.network.classifier(cect_domain_skips)
+        with autocast(self.device.type, enabled=True) if 0 else dummy_context():
+            ############ Segmentation Phase ############
+            ncct_domain_skips = self.network.encoder(ncct_data)
+            ncct_output = self.network.decoder(ncct_domain_skips)
+            
             s_l = self.loss(ncct_output, target)
+            s_l.backward()
+            self.s_optimizer.step()
+
+            result_s_l = s_l.detach()
+
+            #zerograd function
+            self.s_optimizer.zero_grad(set_to_none=True)
+
+            ########### Discriminator Phase ###########
+            ncct_domain_skips = self.network.encoder(ncct_data)
+            cect_domain_skips = self.only_encoder_network(cect_data)
+
+            ncct_domain_output_list = []
+            cect_domain_output_list = []
+            for idx, block in enumerate(self.network.classifier_list):
+                ncct_domain_output_list.append(block(ncct_domain_skips[idx]))
+                cect_domain_output_list.append(block(cect_domain_skips[idx]))
+            
+            ncct_domain_output = torch.stack(ncct_domain_output_list).mean(dim=0)
+            cect_domain_output = torch.stack(cect_domain_output_list).mean(dim=0)
             
             #gamma = self.gamma_scheduler(self.current_epoch, **self.gamma_scheduler_kwargs)
-            #d_l, RelativisticLogits, R1Penalty, R2Penalty = self.domain_loss(ncct_data, cect_data, ncct_domain_output, cect_domain_output, gamma)
-            d_l, RelativisticLogits = self.domain_loss(ncct_domain_output, cect_domain_output)
+            #d_l, RelativisticLogits, R1Penalty, R2Penalty = self.domain_loss(ncct_domain_skips, cect_domain_skips, ncct_domain_output, cect_domain_output, gamma)
+            if torch.rand(1).item() < 0.05:  # 20번 중 한번의 확률로 정규화 실행 실행
+                gamma = self.gamma_scheduler(self.current_epoch, **self.gamma_scheduler_kwargs)
+                d_l, RelativisticLogits, R1Penalty, R2Penalty = self.domain_loss(ncct_domain_skips, cect_domain_skips, ncct_domain_output, cect_domain_output, gamma)
+            else:
+                d_l, RelativisticLogits = self.simple_domain_loss(ncct_domain_output, cect_domain_output)
+            d_l.backward()
+            self.d_optimizer.step()
+            result_d_l = d_l.detach()
+
+            #zerograd function
+            self.g_optimizer.zero_grad(set_to_none=True)
+            self.d_optimizer.zero_grad(set_to_none=True)
+
+            ########### Generator Phase ###########
+            ncct_domain_skips = self.network.encoder(ncct_data)
+            cect_domain_skips = self.only_encoder_network(cect_data)
+
+            ncct_domain_output_list = []
+            cect_domain_output_list = []
+            for idx, block in enumerate(self.network.classifier_list):
+                ncct_domain_output_list.append(block(ncct_domain_skips[idx]))
+                cect_domain_output_list.append(block(cect_domain_skips[idx]))
+            
+            ncct_domain_output = torch.stack(ncct_domain_output_list).mean(dim=0)
+            cect_domain_output = torch.stack(cect_domain_output_list).mean(dim=0)
+
             adv_d_l, _ = self.adv_domain_loss(ncct_domain_output, cect_domain_output)
-            adv_d_l = adv_d_l - d_l
-        #adv_d_l에 -d_l을 해주는 이유는 계산 그래프상 겹쳐버리기 때문에 겹치는 영역의 grad를 없애주기 위해
-        
-        """
-        if self.d_grad_scaler is not None and self.s_grad_scaler is not None and 0:
-            self.s_grad_scaler.scale(adv_d_l).backward(retain_graph=True)
-            self.s_grad_scaler.unscale_(self.s_optimizer)
-            
+            adv_d_l.backward()
+
+            self.g_optimizer.step()
+            #zerograd function
+            self.g_optimizer.zero_grad(set_to_none=True)
             self.d_optimizer.zero_grad(set_to_none=True)
-            
-            self.d_grad_scaler.scale(d_l).backward(retain_graph=True)
-            self.d_grad_scaler.unscale_(self.d_optimizer)
-            
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
-            
-            self.s_grad_scaler.step(self.s_optimizer)
-            self.s_grad_scaler.update()
-        
-            self.d_grad_scaler.step(self.d_optimizer)
-            self.d_grad_scaler.update()
 
-            self.d_optimizer.zero_grad(set_to_none=True)
-            self.s_optimizer.zero_grad(set_to_none=True)
-        else:
-            dummy_context()
-        """
-
-        adv_d_l.backward(retain_graph=True)
-        #self.count = self.count + 1
-        #if self.count % 50 == 0:
-        #    print(adv_d_l)
-        #    for name, param in self.network.named_parameters():
-        #        if param.grad is not None:
-        #            print(f"{name} - Gradient Mean: {param.grad.abs().mean().item()}")
+        if print_log:
+            self.loss_log['s_l'].append(result_s_l.item())
+            self.loss_log['d_l'].append(result_d_l.item())
         
-        self.d_optimizer.zero_grad(set_to_none=True)
-        d_l.backward(retain_graph=True)
-        s_l.backward(retain_graph=True)
-        
-        torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
-        
-        self.d_optimizer.step()
-        self.s_optimizer.step()
-        
-        self.d_optimizer.zero_grad(set_to_none=True)
-        self.s_optimizer.zero_grad(set_to_none=True)    
-        
-        result_s_l = s_l.detach()
-        result_d_l = d_l.detach()
-
+            save_json(self.loss_log, join("/home/ubuntu/seongwoo/log", "DANN_log.json"), sort_keys=False)
         return {'loss': result_s_l.cpu().numpy(), 'domain_loss': result_d_l.cpu().numpy()}
 
     def on_train_epoch_end(self, train_outputs: List[dict]):
@@ -1242,44 +1238,49 @@ class caseby_Decoder_R3GANTrainer2(nnUNetTrainer):
         self.logger.log('class_train_losses', domain_loss_here, self.current_epoch)
 
     def on_validation_epoch_start(self):
-        #current_time = time()
-        #self.print_to_log_file(
-        #    f"Validation Start time: {np.round(current_time - self.before_time, decimals=2)} s")
-        #self.before_time = current_time    
-        self.network.eval()
+        self.network.train()
 
     def validation_step(self, batch: dict) -> dict:
         data = batch['data']
         data = data.to(self.device, non_blocking=True)
-        ncct_data = data[:, 0:1, :, :, :]
-        cect_data = data[:, 1:2, :, :, :]
+        ncct_data = data[:, 0:1, :, :, :]  # B x 1 x D x W x H
+        cect_data = data[:, 1:2, :, :, :]  # B x 1 x D x W x H
         
         target = batch['target']
-        
-        #ncct_data = ncct_data.to(self.device, non_blocking=True)
-        #cect_data = cect_data.to(self.device, non_blocking=True)
         
         if isinstance(target, list):
             target = [i.to(self.device, non_blocking=True) for i in target]
         else:
             target = target.to(self.device, non_blocking=True)
         
+
+        # Autocast can be annoying
+        # If the device_type is 'cpu' then it's slow as heck and needs to be disabled.
+        # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
+        # So autocast will only be active if we have a cuda device.
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
             cect_domain_skips = self.only_encoder_network(cect_data)
-            output, ncct_domain_output = self.network(ncct_data)
-            cect_domain_output = self.network.classifier(cect_domain_skips)
-            
-            #cect_domain_output = []
-            #for idx, block in enumerate(self.only_encoder_network.classifier_list):
-            #    cect_domain_output.append(block(cect_domain_skips[idx]))
+            ncct_domain_skips = self.network.encoder(ncct_data)
+            output = self.network.decoder(ncct_domain_skips)
+    
+            #output, ncct_domain_output_list = self.network(ncct_data)
+            ncct_domain_output_list = []
+            cect_domain_output_list = []
+            for idx, block in enumerate(self.network.classifier_list):
+                ncct_domain_output_list.append(block(ncct_domain_skips[idx]))
+                cect_domain_output_list.append(block(cect_domain_skips[idx]))
             del ncct_data
             del cect_data
             
             l = self.loss(output, target)
-            #gamma = self.gamma_scheduler(self.current_epoch, **self.gamma_scheduler_kwargs)
-            #d_l, RelativisticLogits, R1Penalty, R2Penalty = self.domain_loss(ncct_data, cect_data, ncct_domain_output, cect_domain_output, gamma)
-            d_l, RelativisticLogits = self.domain_loss(ncct_domain_output, cect_domain_output)
-        
+            
+            ncct_domain_output = torch.stack(ncct_domain_output_list).mean(dim=0)
+            cect_domain_output = torch.stack(cect_domain_output_list).mean(dim=0)
+            
+            gamma = self.gamma_scheduler(self.current_epoch, **self.gamma_scheduler_kwargs)
+            d_l, RelativisticLogits, R1Penalty, R2Penalty = self.domain_loss(ncct_domain_skips, cect_domain_skips, ncct_domain_output, cect_domain_output, gamma)
+            #d_l, RelativisticLogits = self.domain_loss(ncct_domain_output, cect_domain_output)
+            
         # we only need the output with the highest output resolution (if DS enabled)
         if self.enable_deep_supervision:
             output = output[0]
@@ -1314,7 +1315,7 @@ class caseby_Decoder_R3GANTrainer2(nnUNetTrainer):
         
         RelativisticLogits = RelativisticLogits.detach()
         sign = RelativisticLogits.sign()
-        #print(f"CECT Logits - NCCT Logits = {RelativisticLogits}, sign : {sign}")
+        print(f"CECT Logits - NCCT Logits = {RelativisticLogits}, sign : {sign}")
         domain_t = torch.sum((sign == 1)).item()
         domain_f = torch.sum((sign == 0)).item() + torch.sum((sign == -1)).item()
             
@@ -1429,6 +1430,7 @@ class caseby_Decoder_R3GANTrainer2(nnUNetTrainer):
                     'network_weights': mod.state_dict(),
                     's_optimizer_state': self.s_optimizer.state_dict(),
                     'd_optimizer_state': self.d_optimizer.state_dict(),
+                    'g_optimizer_state': self.g_optimizer.state_dict(),
                     's_grad_scaler_state': self.s_grad_scaler.state_dict() if self.s_grad_scaler is not None else None,
                     'd_grad_scaler_state': self.d_grad_scaler.state_dict() if self.d_grad_scaler is not None else None,
                     'logging': self.logger.get_checkpoint(),
@@ -1477,8 +1479,7 @@ class caseby_Decoder_R3GANTrainer2(nnUNetTrainer):
                 self.network.load_state_dict(new_state_dict)
         self.s_optimizer.load_state_dict(checkpoint['s_optimizer_state'])
         self.d_optimizer.load_state_dict(checkpoint['d_optimizer_state'])
-
-        
+        self.g_optimizer.load_state_dict(checkpoint['g_optimizer_state'])
         
         if self.s_grad_scaler is not None:
             if checkpoint['s_grad_scaler_state'] is not None:
@@ -1486,7 +1487,6 @@ class caseby_Decoder_R3GANTrainer2(nnUNetTrainer):
         if self.d_grad_scaler is not None:
             if checkpoint['d_grad_scaler_state'] is not None:
                 self.d_grad_scaler.load_state_dict(checkpoint['d_grad_scaler_state'])
-
 
 
     def perform_actual_validation(self, save_probabilities: bool = False):
@@ -1645,12 +1645,12 @@ class caseby_Decoder_R3GANTrainer2(nnUNetTrainer):
                 train_outputs.append(self.train_step(next(self.dataloader_train)))
             self.on_train_epoch_end(train_outputs)
 
-            with torch.no_grad():
-                self.on_validation_epoch_start()
-                val_outputs = []
-                for batch_id in range(self.num_val_iterations_per_epoch):
-                    val_outputs.append(self.validation_step(next(self.dataloader_val)))
-                self.on_validation_epoch_end(val_outputs)
+            #with torch.no_grad():
+            self.on_validation_epoch_start()
+            val_outputs = []
+            for batch_id in range(self.num_val_iterations_per_epoch):
+                val_outputs.append(self.validation_step(next(self.dataloader_val)))
+            self.on_validation_epoch_end(val_outputs)
 
             self.on_epoch_end()
 

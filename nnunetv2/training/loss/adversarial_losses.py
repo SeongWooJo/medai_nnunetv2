@@ -5,8 +5,14 @@ import numpy as np
 class adversarial_losses:
     @staticmethod
     def ZeroCenteredGradientPenalty(Samples, Critics):
-        Gradient, = torch.autograd.grad(outputs=Critics.sum(), inputs=Samples, create_graph=True)
-        return Gradient.square().sum([1, 2, 3])
+        #Gradient, = torch.autograd.grad(outputs=Critics.sum(), inputs=sample, create_graph=True)   
+        total_sample_len = len(Samples)
+        Gradient = None
+        for sample in Samples:
+            temp_Gradient, = torch.autograd.grad(outputs=Critics.sum(), inputs=sample, create_graph=True)
+            Gradient = Gradient + temp_Gradient.square().sum([1, 2, 3, 4]) * (1/total_sample_len) if Gradient is not None else temp_Gradient.square().sum([1, 2, 3, 4])
+        return Gradient
+        #return Gradient.square().sum([1, 2, 3])
 
     def AccumulateGeneratorGradients(NCCTLogits, CECTLogits):
         # Generator 입장, 즉 여기서는 Encoder의 입장에선 CECT - NCCT Logits값을 작게 만드는 방향으로 학습 -> NCCT Logits을 키우는 방향으로 학습을 수행

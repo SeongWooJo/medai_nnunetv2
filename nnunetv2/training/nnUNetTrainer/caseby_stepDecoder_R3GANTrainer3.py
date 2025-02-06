@@ -78,7 +78,7 @@ from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
 
 
 
-class caseby_Decoder_R3GANTrainer2(nnUNetTrainer):
+class caseby_stepDecoder_R3GANTrainer3(nnUNetTrainer):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict, unpack_dataset: bool = True,
                  device: torch.device = torch.device('cuda')):
         # From https://grugbrain.dev/. Worth a read ya big brains ;-)
@@ -156,7 +156,7 @@ class caseby_Decoder_R3GANTrainer2(nnUNetTrainer):
 
         ### Some hyperparameters for you to fiddle with
         self.s_initial_lr = 1e-2
-        self.d_initial_lr = 1e-4
+        self.d_initial_lr = 2e-4
         self.weight_decay = 3e-5
         self.oversample_foreground_percent = 0.33
         self.num_iterations_per_epoch = 250
@@ -175,12 +175,13 @@ class caseby_Decoder_R3GANTrainer2(nnUNetTrainer):
         #self.optimizer = self.lr_scheduler = None  # -> self.initialize
         self.s_optimizer = self.s_lr_scheduler = None
         self.d_optimizer = self.d_lr_scheduler = None
+        self.g_optimizer = self.g_lr_scheduler = None
 
-        
+        #self.only_encoder_graph = torch.cuda.CUDAGraph()
         
         self.s_grad_scaler = GradScaler() if self.device.type == 'cuda' else None
         self.d_grad_scaler = GradScaler() if self.device.type == 'cuda' else None
-
+        self.g_grad_scaler = GradScaler() if self.device.type == 'cuda' else None
         #self.s_grad_scaler = None
         #self.d_grad_scaler = None
 
@@ -280,7 +281,7 @@ class caseby_Decoder_R3GANTrainer2(nnUNetTrainer):
                 self.network = torch.compile(self.network)
                 self.only_encoder_network = torch.compile(self.only_encoder_network)
 
-            self.s_optimizer, self.s_lr_scheduler, self.d_optimizer, self.d_lr_scheduler = self.configure_optimizers()
+            self.s_optimizer, self.s_lr_scheduler, self.d_optimizer, self.d_lr_scheduler, self.g_optimizer, self.g_lr_scheduler = self.configure_optimizers()
             # if ddp, wrap in DDP wrapper
             if self.is_ddp:
                 self.network = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.network)
@@ -295,8 +296,8 @@ class caseby_Decoder_R3GANTrainer2(nnUNetTrainer):
                 'max_epoch': self.num_epochs
             }
             self.gamma_scheduler = adversarial_losses.cosine_decay_with_warmup
-            #self.domain_loss = adversarial_losses.AccumulateDiscriminatorGradients
-            self.domain_loss = adversarial_losses.SimpleDiscriminatorGradients
+            self.domain_loss = adversarial_losses.AccumulateDiscriminatorGradients
+            self.simple_domain_loss = adversarial_losses.SimpleDiscriminatorGradients
             self.adv_domain_loss = adversarial_losses.AccumulateGeneratorGradients
             #self.domain_loss = nn.BCEWithLogitsLoss()
             
@@ -631,16 +632,17 @@ class caseby_Decoder_R3GANTrainer2(nnUNetTrainer):
         s_optimizer = torch.optim.SGD(list(self.network.encoder.parameters()) + list(self.network.decoder.parameters()), self.s_initial_lr, weight_decay=self.weight_decay,
                                     momentum=0.99, nesterov=True)
         #domain
-        d_optimizer = torch.optim.SGD(list(self.network.classifier.parameters()), self.d_initial_lr, weight_decay=self.weight_decay,
-                                    momentum=0.99, nesterov=True)
+        d_optimizer = torch.optim.SGD(list(self.network.encoder.parameters()), self.d_initial_lr)
         
+        g_optimizer = torch.optim.SGD(list(self.network.classifier.parameters()), self.d_initial_lr)
 
         s_lr_scheduler = PolyLRScheduler(s_optimizer, self.s_initial_lr, self.num_epochs)
-        d_lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(d_optimizer, T_0=67, T_mult=2, eta_min=(self.d_initial_lr / 20),last_epoch=-1)
+        d_lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(d_optimizer, T_0=67, T_mult=2, eta_min=5e-5,last_epoch=-1)
+        g_lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(g_optimizer, T_0=67, T_mult=2, eta_min=5e-5,last_epoch=-1)
 
         #d_lr_scheduler = PolyLRScheduler(d_optimizer, self.d_initial_lr, self.num_epochs)
         
-        return s_optimizer, s_lr_scheduler, d_optimizer, d_lr_scheduler
+        return s_optimizer, s_lr_scheduler, d_optimizer, d_lr_scheduler, g_optimizer, g_lr_scheduler
 
     def plot_network_architecture(self):
         if self._do_i_compile():
@@ -1104,6 +1106,7 @@ class caseby_Decoder_R3GANTrainer2(nnUNetTrainer):
         self.only_encoder_network.eval()
         self.s_lr_scheduler.step(self.current_epoch)
         self.d_lr_scheduler.step(self.current_epoch)
+        self.g_lr_scheduler.step(self.current_epoch)
         self.count = 0
         self.print_to_log_file('')
         self.print_to_log_file(f'Epoch {self.current_epoch}')
@@ -1117,106 +1120,105 @@ class caseby_Decoder_R3GANTrainer2(nnUNetTrainer):
 
     def train_step(self, batch: dict) -> dict:
         data = batch['data']
-        target = batch['target']
-
         data = data.to(self.device, non_blocking=True)
         ncct_data = data[:, 0:1, :, :, :]  # B x 1 x D x W x H
         cect_data = data[:, 1:2, :, :, :]  # B x 1 x D x W x H
-        #print(data.requires_grad)
-        #ncct_data = ncct_data.to(self.device, non_blocking=True)
-        #cect_data = cect_data.to(self.device, non_blocking=True)
+        target = batch['target']
+
         if isinstance(target, list):
             target = [i.to(self.device, non_blocking=True) for i in target]
         else:
             target = target.to(self.device, non_blocking=True)
         
-        #current_time = time()
-        #before_time = self.logger.my_fantastic_logging['epoch_start_timestamps'][-1]
-        #self.print_to_log_file(
-        #    f"Data upLoad time: {np.round(current_time - before_time, decimals=2)} s")
-        #before_time = current_time
 
         # Autocast can be annoying
         # If the device_type is 'cpu' then it's slow as heck and needs to be disabled.
         # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
         # So autocast will only be active if we have a cuda device.
-        with autocast(self.device.type, enabled=True, dtype=torch.bfloat16) if self.device.type == 'cuda' and 0 else dummy_context():
-        #with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
-            cect_domain_skips = self.only_encoder_network(cect_data)
-            ncct_output, ncct_domain_output = self.network(ncct_data)
-            """
-            self.count = self.count + 1
-            if self.count == 27:
-                current_time = time()
-                self.before_time = self.logger.my_fantastic_logging['epoch_start_timestamps'][-1]
-                self.print_to_log_file(
-                    f"{self.count} Data excute time: {np.round(current_time - self.before_time, decimals=2)} s")
-                self.before_time = current_time
-            elif self.count % 27 == 0:
-                current_time = time()
-                self.print_to_log_file(
-                    f"{self.count} Data excute time: {np.round(current_time - self.before_time, decimals=2)} s")
-                self.before_time = current_time    
-            """
-
-            cect_domain_output = self.network.classifier(cect_domain_skips)
-            s_l = self.loss(ncct_output, target)
-            
-            #gamma = self.gamma_scheduler(self.current_epoch, **self.gamma_scheduler_kwargs)
-            #d_l, RelativisticLogits, R1Penalty, R2Penalty = self.domain_loss(ncct_data, cect_data, ncct_domain_output, cect_domain_output, gamma)
-            d_l, RelativisticLogits = self.domain_loss(ncct_domain_output, cect_domain_output)
-            adv_d_l, _ = self.adv_domain_loss(ncct_domain_output, cect_domain_output)
-            adv_d_l = adv_d_l - d_l
-        #adv_d_l에 -d_l을 해주는 이유는 계산 그래프상 겹쳐버리기 때문에 겹치는 영역의 grad를 없애주기 위해
+        #with autocast(self.device.type, enabled=True, dtype=torch.bfloat16) if self.device.type == 'cuda' and 0 else dummy_context():
+        ############ Segmentation Phase ############
+        ncct_domain_skips = self.network.encoder(ncct_data)
+        ncct_output = self.network.decoder(ncct_domain_skips)
         
-        """
-        if self.d_grad_scaler is not None and self.s_grad_scaler is not None and 0:
-            self.s_grad_scaler.scale(adv_d_l).backward(retain_graph=True)
-            self.s_grad_scaler.unscale_(self.s_optimizer)
-            
-            self.d_optimizer.zero_grad(set_to_none=True)
-            
-            self.d_grad_scaler.scale(d_l).backward(retain_graph=True)
-            self.d_grad_scaler.unscale_(self.d_optimizer)
-            
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
-            
-            self.s_grad_scaler.step(self.s_optimizer)
-            self.s_grad_scaler.update()
-        
-            self.d_grad_scaler.step(self.d_optimizer)
-            self.d_grad_scaler.update()
-
-            self.d_optimizer.zero_grad(set_to_none=True)
-            self.s_optimizer.zero_grad(set_to_none=True)
-        else:
-            dummy_context()
-        """
-
-        adv_d_l.backward(retain_graph=True)
-        #self.count = self.count + 1
-        #if self.count % 50 == 0:
-        #    print(adv_d_l)
-        #    for name, param in self.network.named_parameters():
-        #        if param.grad is not None:
-        #            print(f"{name} - Gradient Mean: {param.grad.abs().mean().item()}")
-        
-        self.d_optimizer.zero_grad(set_to_none=True)
-        d_l.backward(retain_graph=True)
-        s_l.backward(retain_graph=True)
-        
-        torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
-        
-        self.d_optimizer.step()
+        s_l = self.loss(ncct_output, target)
+        s_l.backward()
         self.s_optimizer.step()
-        
-        self.d_optimizer.zero_grad(set_to_none=True)
-        self.s_optimizer.zero_grad(set_to_none=True)    
-        
-        result_s_l = s_l.detach()
-        result_d_l = d_l.detach()
 
-        return {'loss': result_s_l.cpu().numpy(), 'domain_loss': result_d_l.cpu().numpy()}
+        result_s_l = s_l.detach()
+        #zerograd function
+        self.s_optimizer.zero_grad(set_to_none=True)
+        result_d_l = None
+        ########### Discriminator Phase ###########
+    
+        ncct_domain_skips = self.network.encoder(ncct_data)
+        cect_domain_skips = self.only_encoder_network(cect_data)
+        
+        ncct_domain_output = self.network.classifier(ncct_domain_skips)
+        cect_domain_output = self.network.classifier(cect_domain_skips)
+        
+        if torch.rand(1).item() < 0.05:  # 20번 중 한번의 확률로 정규화 실행 실행
+            gamma = self.gamma_scheduler(self.current_epoch, **self.gamma_scheduler_kwargs)
+            d_l, RelativisticLogits, R1Penalty, R2Penalty = self.domain_loss(ncct_domain_skips, cect_domain_skips, ncct_domain_output, cect_domain_output, gamma)
+        else:
+            d_l, RelativisticLogits = self.simple_domain_loss(ncct_domain_output, cect_domain_output)
+        d_l.backward()
+        self.d_optimizer.step()
+        result_d_l = d_l.detach().cpu().item()
+
+        #zerograd function
+        self.g_optimizer.zero_grad(set_to_none=True)
+        self.d_optimizer.zero_grad(set_to_none=True)
+    
+        ########### Generator Phase ###########
+        if torch.rand(1).item() < 0.2:  # 20% 확률로 Generator 학습 실행
+            ncct_domain_skips = self.network.encoder(ncct_data)
+            cect_domain_skips = self.only_encoder_network(cect_data)
+            
+            ncct_domain_output = self.network.classifier(ncct_domain_skips)
+            cect_domain_output = self.network.classifier(cect_domain_skips)
+
+            adv_d_l, _ = self.adv_domain_loss(ncct_domain_output, cect_domain_output)
+            adv_d_l.backward()
+
+            self.g_optimizer.step()
+            #zerograd function
+            self.g_optimizer.zero_grad(set_to_none=True)
+            self.d_optimizer.zero_grad(set_to_none=True)    
+        """
+        ########### Discriminator Phase ###########
+        ncct_domain_skips = self.network.encoder(ncct_data)
+        cect_domain_skips = self.only_encoder_network(cect_data)
+        
+        ncct_domain_output = self.network.classifier(ncct_domain_skips)
+        cect_domain_output = self.network.classifier(cect_domain_skips)
+        
+        #gamma = self.gamma_scheduler(self.current_epoch, **self.gamma_scheduler_kwargs)
+        #d_l, RelativisticLogits, R1Penalty, R2Penalty = self.domain_loss(ncct_domain_skips, cect_domain_skips, ncct_domain_output, cect_domain_output, gamma)
+        d_l, RelativisticLogits = self.simple_domain_loss(ncct_domain_output, cect_domain_output)
+        d_l.backward()
+        self.d_optimizer.step()
+        result_d_l = d_l.detach()
+        
+        #zerograd function
+        self.g_optimizer.zero_grad(set_to_none=True)
+        self.d_optimizer.zero_grad(set_to_none=True)
+        
+        ########### Generator Phase ###########
+        ncct_domain_skips = self.network.encoder(ncct_data)
+        cect_domain_skips = self.only_encoder_network(cect_data)
+        
+        ncct_domain_output = self.network.classifier(ncct_domain_skips)
+        cect_domain_output = self.network.classifier(cect_domain_skips)
+
+        adv_d_l, _ = self.adv_domain_loss(ncct_domain_output, cect_domain_output)
+        adv_d_l.backward()
+
+        self.g_optimizer.step()
+        #zerograd function
+        self.g_optimizer.zero_grad(set_to_none=True)
+        self.d_optimizer.zero_grad(set_to_none=True)
+        """
+        return {'loss': result_s_l.cpu().numpy(), 'domain_loss': result_d_l}
 
     def on_train_epoch_end(self, train_outputs: List[dict]):
         outputs = collate_outputs(train_outputs)
@@ -1230,7 +1232,7 @@ class caseby_Decoder_R3GANTrainer2(nnUNetTrainer):
         if self.is_ddp:
             losses_tr = [None for _ in range(dist.get_world_size())]
             dist.all_gather_object(losses_tr, outputs['loss'])
-            loss_here = np.vstack(losses_tr).mean()
+            loss_here = np.vstack(losses_tr).mean() * 5 ## 0.2 확률로만 계산되고 나머지는 0이므로
             domain_losses_tr = [None for _ in range(dist.get_world_size())]
             dist.all_gather_object(domain_losses_tr, outputs['domain_loss'])
             domain_loss_here = np.vstack(domain_losses_tr).mean()
@@ -1242,10 +1244,6 @@ class caseby_Decoder_R3GANTrainer2(nnUNetTrainer):
         self.logger.log('class_train_losses', domain_loss_here, self.current_epoch)
 
     def on_validation_epoch_start(self):
-        #current_time = time()
-        #self.print_to_log_file(
-        #    f"Validation Start time: {np.round(current_time - self.before_time, decimals=2)} s")
-        #self.before_time = current_time    
         self.network.eval()
 
     def validation_step(self, batch: dict) -> dict:
@@ -1255,9 +1253,6 @@ class caseby_Decoder_R3GANTrainer2(nnUNetTrainer):
         cect_data = data[:, 1:2, :, :, :]
         
         target = batch['target']
-        
-        #ncct_data = ncct_data.to(self.device, non_blocking=True)
-        #cect_data = cect_data.to(self.device, non_blocking=True)
         
         if isinstance(target, list):
             target = [i.to(self.device, non_blocking=True) for i in target]
@@ -1269,16 +1264,13 @@ class caseby_Decoder_R3GANTrainer2(nnUNetTrainer):
             output, ncct_domain_output = self.network(ncct_data)
             cect_domain_output = self.network.classifier(cect_domain_skips)
             
-            #cect_domain_output = []
-            #for idx, block in enumerate(self.only_encoder_network.classifier_list):
-            #    cect_domain_output.append(block(cect_domain_skips[idx]))
             del ncct_data
             del cect_data
             
             l = self.loss(output, target)
             #gamma = self.gamma_scheduler(self.current_epoch, **self.gamma_scheduler_kwargs)
             #d_l, RelativisticLogits, R1Penalty, R2Penalty = self.domain_loss(ncct_data, cect_data, ncct_domain_output, cect_domain_output, gamma)
-            d_l, RelativisticLogits = self.domain_loss(ncct_domain_output, cect_domain_output)
+            d_l, RelativisticLogits = self.simple_domain_loss(ncct_domain_output, cect_domain_output)
         
         # we only need the output with the highest output resolution (if DS enabled)
         if self.enable_deep_supervision:
@@ -1314,7 +1306,7 @@ class caseby_Decoder_R3GANTrainer2(nnUNetTrainer):
         
         RelativisticLogits = RelativisticLogits.detach()
         sign = RelativisticLogits.sign()
-        #print(f"CECT Logits - NCCT Logits = {RelativisticLogits}, sign : {sign}")
+        print(f"CECT Logits - NCCT Logits = {RelativisticLogits}, sign : {sign}")
         domain_t = torch.sum((sign == 1)).item()
         domain_f = torch.sum((sign == 0)).item() + torch.sum((sign == -1)).item()
             
@@ -1429,6 +1421,7 @@ class caseby_Decoder_R3GANTrainer2(nnUNetTrainer):
                     'network_weights': mod.state_dict(),
                     's_optimizer_state': self.s_optimizer.state_dict(),
                     'd_optimizer_state': self.d_optimizer.state_dict(),
+                    'g_optimizer_state': self.g_optimizer.state_dict(),
                     's_grad_scaler_state': self.s_grad_scaler.state_dict() if self.s_grad_scaler is not None else None,
                     'd_grad_scaler_state': self.d_grad_scaler.state_dict() if self.d_grad_scaler is not None else None,
                     'logging': self.logger.get_checkpoint(),
@@ -1477,6 +1470,7 @@ class caseby_Decoder_R3GANTrainer2(nnUNetTrainer):
                 self.network.load_state_dict(new_state_dict)
         self.s_optimizer.load_state_dict(checkpoint['s_optimizer_state'])
         self.d_optimizer.load_state_dict(checkpoint['d_optimizer_state'])
+        self.g_optimizer.load_state_dict(checkpoint['g_optimizer_state'])
 
         
         
