@@ -1070,7 +1070,7 @@ class Regioned_KDTrainer_CE_T2(nnUNetTrainer):
                 teacher_output = self.teacher_network(data_1)           # CECT
             
             # Forward pass with the student model
-            student_output = self.network(data_0)                       # NCCT
+            student_output, target_feature = self.network(data_0)                       # NCCT
             
             mask_list = []
             for target_elem in target:
