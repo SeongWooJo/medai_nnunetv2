@@ -1082,17 +1082,18 @@ class con2_KDTrainer_CE_T2(nnUNetTrainer):
             #    target_mask = mask_list[idx]
             #    student_output[idx] = student_output[idx] * target_mask
             #    teacher_output[idx] = teacher_output[idx] * target_mask
+            batch_size = data.size(0)
             teacher_kidney_feature = teacher_feature * kidney_mask
-            teacher_kidney_vector = teacher_kidney_feature.mean(dim=(2,3,4))
+            teacher_kidney_vector = teacher_kidney_feature.mean(dim=1).view(batch_size, -1)
 
             student_kidney_feature = student_feature * kidney_mask
-            student_kidney_vector = student_kidney_feature.mean(dim=(2,3,4))
+            student_kidney_vector = student_kidney_feature.mean(dim=1).view(batch_size, -1)
             
             teacher_tumor_feature = teacher_feature * tumor_mask
-            teacher_tumor_vector = teacher_tumor_feature.mean(dim=(2,3,4))
+            teacher_tumor_vector = teacher_tumor_feature.mean(dim=1).view(batch_size, -1)
 
             student_tumor_feature = student_feature * tumor_mask
-            student_tumor_vector = student_tumor_feature.mean(dim=(2,3,4))
+            student_tumor_vector = student_tumor_feature.mean(dim=1).view(batch_size, -1)
 
             tumor_similarity = torch.nn.functional.cosine_similarity(teacher_tumor_vector, student_tumor_vector, dim=1)
             kidney_similarity = torch.nn.functional.cosine_similarity(teacher_kidney_vector, student_tumor_vector, dim=1)

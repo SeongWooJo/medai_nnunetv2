@@ -46,7 +46,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from nnunetv2.configuration import ANISO_THRESHOLD, default_num_processes
 from nnunetv2.evaluation.evaluate_predictions import compute_metrics_on_folder
 from nnunetv2.inference.export_prediction import export_prediction_from_logits, resample_and_save
-from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
+from nnunetv2.inference.case_predict_from_raw_data import CasePredictor
 from nnunetv2.inference.sliding_window_prediction import compute_gaussian
 from nnunetv2.paths import nnUNet_preprocessed, nnUNet_results
 from nnunetv2.training.data_augmentation.compute_initial_patch_size import get_patch_size
@@ -81,7 +81,7 @@ from threadpoolctl import threadpool_limits
 # -> use KLDiv Loss
 # not working...
 
-class con_KDTrainer_CE_T2(nnUNetTrainer):
+class pixelwise_dotproduct_Trainer(nnUNetTrainer):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict, unpack_dataset: bool = True,
                  device: torch.device = torch.device('cuda')):
         # From https://grugbrain.dev/. Worth a read ya big brains ;-)
@@ -1056,7 +1056,7 @@ class con_KDTrainer_CE_T2(nnUNetTrainer):
         
         data_0 = data_0.to(self.device, non_blocking=True)
         data_1 = data_1.to(self.device, non_blocking=True)
-        
+        batch_size = data_0.size(0)
         if isinstance(target, list):
             target = [i.to(self.device, non_blocking=True) for i in target]
         else:
@@ -1078,44 +1078,134 @@ class con_KDTrainer_CE_T2(nnUNetTrainer):
             
                 
             student_l = self.loss(student_output, target)               # DC_CE_loss(student network output, gt label)
-            #for idx, target_elem in enumerate(target):
-            #    target_mask = mask_list[idx]
-            #    student_output[idx] = student_output[idx] * target_mask
-            #    teacher_output[idx] = teacher_output[idx] * target_mask
-            teacher_kidney_feature = teacher_feature * kidney_mask
-            teacher_kidney_vector = teacher_kidney_feature.mean(dim=(2,3,4))
-
-            student_kidney_feature = student_feature * kidney_mask
-            student_kidney_vector = student_kidney_feature.mean(dim=(2,3,4))
             
+            teacher_kidney_feature = teacher_feature * kidney_mask
+            student_kidney_feature = student_feature * kidney_mask
             teacher_tumor_feature = teacher_feature * tumor_mask
-            teacher_tumor_vector = teacher_tumor_feature.mean(dim=(2,3,4))
-
             student_tumor_feature = student_feature * tumor_mask
-            student_tumor_vector = student_tumor_feature.mean(dim=(2,3,4))
+            
+            random_sample_nums = 100
+            
+            ## tumor, kidney mask를 (batch, depth, height, width)로 압축시키고 그곳에 0이 아닌 positions만 가져옴
+            ## tensor(list of list)
+            kidney_positions = kidney_mask.squeeze(dim=1).nonzero(as_tuple=False)
+            tumor_positions = tumor_mask.squeeze(dim=1).nonzero(as_tuple=False)
+            
+            contrast_condition = False
+            if not len(list(set(torch.unique(kidney_positions[:, 0]).tolist()) & set(torch.unique(tumor_positions[:, 0]).tolist()))) == 0:
+                contrast_condition = True
+            
+            if contrast_condition:
+                #print("test")
+                # batch별 인덱스 추출
+                unique_batches, inverse_indices = torch.unique(kidney_positions[:, 0], return_inverse=True)
+                batch_counts = torch.bincount(inverse_indices)
 
-            tumor_similarity = torch.nn.functional.cosine_similarity(teacher_tumor_vector, student_tumor_vector, dim=1)
-            kidney_similarity = torch.nn.functional.cosine_similarity(teacher_kidney_vector, student_tumor_vector, dim=1)
-            sim_loss = (1 - tumor_similarity).mean() + torch.nn.functional.relu(kidney_similarity - 0.5).mean()
-            exp_t = torch.exp(tumor_similarity)
-            exp_k = torch.exp(kidney_similarity)
+                kidney_splits = torch.split(kidney_positions, batch_counts.tolist())
+                batch_kidney_positions = {key: torch.empty((0,)) for key in range(batch_size)}  # 모든 key를 기본적으로 빈 리스트로 초기화
 
-            sim_loss = -1 * torch.log(exp_t.sum(dim=0) / exp_k.sum(dim=0))
+                batch_kidney_positions.update({unique_batches[i].item(): kidney_splits[i] for i in range(len(unique_batches))})
+                
+                unique_batches, inverse_indices = torch.unique(tumor_positions[:, 0], return_inverse=True)
+                batch_counts = torch.bincount(inverse_indices)
+                tumor_splits = torch.split(tumor_positions, batch_counts.tolist())
+                batch_tumor_positions = {key: torch.empty((0,)) for key in range(batch_size)}  # 모든 key를 기본적으로 빈 리스트로 초기화
+
+                batch_tumor_positions.update({unique_batches[i].item(): tumor_splits[i] for i in range(len(unique_batches))})
+
+                # 각 배치별 벡터 저장 리스트
+                batch_teacher_kidney_vectors = [torch.empty((0,), device=self.device) for _ in range(batch_size)]
+                batch_teacher_tumor_vectors = [torch.empty((0,), device=self.device) for _ in range(batch_size)]
+                batch_student_tumor_vectors = [torch.empty((0,), device=self.device) for _ in range(batch_size)]
+                
+                batch_tumor_distances = [torch.empty((0,), device=self.device) for _ in range(batch_size)]
+                batch_kidney_distances = [torch.empty((0,), device=self.device) for _ in range(batch_size)]
+
+                for batch_num in range(0,batch_size):
+                    if len(batch_tumor_positions[batch_num]) == 0 or len(batch_kidney_positions[batch_num]) == 0:
+                        continue
+                    tumor_idx = torch.randint(0, len(batch_tumor_positions[batch_num]), (random_sample_nums,), device=self.device)
+                    tumor_idx2 = torch.randint(0, len(batch_tumor_positions[batch_num]), (random_sample_nums,), device=self.device)
+                    
+                    sample_tumor_pos1 = batch_tumor_positions[batch_num][tumor_idx]
+                    sample_tumor_pos2 = batch_tumor_positions[batch_num][tumor_idx2]
+                    
+                    tumor1_depth_idx, tumor1_height_idx, tumor1_width_idx = sample_tumor_pos1[:, 1], sample_tumor_pos1[:, 2], sample_tumor_pos1[:, 3]
+                    tumor2_depth_idx, tumor2_height_idx, tumor2_width_idx = sample_tumor_pos2[:, 1], sample_tumor_pos2[:, 2], sample_tumor_pos2[:, 3]
+                    
+                    tumor_distances = torch.sqrt(
+                        (tumor2_depth_idx - tumor1_depth_idx) ** 2 +
+                        (tumor2_height_idx - tumor1_height_idx) ** 2 +
+                        (tumor2_width_idx - tumor1_width_idx) ** 2
+                    )
+
+                    tumor_min, tumor_max = torch.aminmax(tumor_distances, dim=0)
+                    tumor_distances_norm = None
+                    if tumor_min == tumor_max:
+                        tumor_distances_norm = torch.ones(random_sample_nums, device=self.device) * (1/random_sample_nums)
+                    else:
+                        tumor_distances_norm = 1 - (tumor_distances - tumor_min) / (tumor_max - tumor_min)
+                    batch_tumor_distances[batch_num] = tumor_distances_norm
+                    
+                    teacher_tumor_vector = teacher_tumor_feature[batch_num, :, tumor1_depth_idx, tumor1_height_idx, tumor1_width_idx].T
+                    student_tumor_vector = student_tumor_feature[batch_num, :, tumor2_depth_idx, tumor2_height_idx, tumor2_width_idx].T
+
+                    batch_teacher_tumor_vectors[batch_num] = teacher_tumor_vector
+                    batch_student_tumor_vectors[batch_num] = student_tumor_vector
+                    
+                    kidney_idx = torch.randint(0, len(batch_kidney_positions[batch_num]), (random_sample_nums,), device=self.device)
+                    sample_kidney_pos = batch_kidney_positions[batch_num][kidney_idx]
+                    kidney_depth_idx, kidney_height_idx, kidney_width_idx = sample_kidney_pos[:, 1], sample_kidney_pos[:, 2], sample_kidney_pos[:, 3]
+
+                    teacher_kidney_vector = teacher_kidney_feature[batch_num, :, kidney_depth_idx, kidney_height_idx, kidney_width_idx].T  # (c,)
+                    kidney_distances = torch.sqrt(
+                        (tumor2_depth_idx - kidney_depth_idx) ** 2 +
+                        (tumor2_height_idx - kidney_height_idx) ** 2 +
+                        (tumor2_width_idx - kidney_width_idx) ** 2
+                    )
+                    kidney_min, kidney_max = torch.aminmax(kidney_distances, dim=0)
+                    kidney_distances_norm = None
+                    if kidney_min == kidney_max:
+                        kidney_distances_norm = torch.ones(random_sample_nums, device=self.device) * (1/random_sample_nums)
+                    else:
+                        kidney_distances_norm = 1 - (kidney_distances - kidney_min) / (kidney_max - kidney_min)
+                    batch_kidney_distances[batch_num] = kidney_distances_norm
+                    batch_teacher_kidney_vectors[batch_num] = teacher_kidney_vector
+                # 리스트 -> 텐서 변환 (각 batch별로 쌓기)
+                teacher_kidney_tensor = torch.cat([v for v in batch_teacher_kidney_vectors if not len(v) == 0], dim=0)
+                teacher_tumor_tensor = torch.cat([v for v in batch_teacher_tumor_vectors if not len(v) == 0], dim=0)
+                student_tumor_tensor = torch.cat([v for v in batch_student_tumor_vectors if not len(v) == 0], dim=0)
+                
+                tumor_distance_tensor = torch.cat([v for v in batch_tumor_distances if not len(v) == 0], dim=0)
+                kidney_distance_tensor = torch.cat([v for v in batch_kidney_distances if not len(v) == 0], dim=0)
+
+                #print(teacher_tumor_vector.shape)
+                #print(student_tumor_vector.shape)
+                #print(tumor_distance_tensor.shape)
+                
+                tumor_similarity = torch.sum(teacher_tumor_tensor * student_tumor_tensor, dim=-1) * tumor_distance_tensor
+                kidney_similarity = torch.sum(teacher_kidney_tensor * student_tumor_tensor, dim=-1) * kidney_distance_tensor
+                exp_t = torch.exp(tumor_similarity)
+                exp_k = torch.exp(kidney_similarity)
+                sim_loss = -1 / (2*random_sample_nums) * torch.log(exp_t.sum(dim=0) / exp_k.sum(dim=0))
+            else:
+                sim_loss = 0
+            print(sim_loss)
             # Weight needs to be adjusted
             student_weight = 0.75
             sim_weight = 0.25
             l = student_weight * student_l + sim_weight * sim_loss
             
-        if self.grad_scaler is not None:
-            self.grad_scaler.scale(l).backward()
-            self.grad_scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
-            self.grad_scaler.step(self.optimizer)
-            self.grad_scaler.update()
-        else:
-            l.backward()
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
-            self.optimizer.step()
+        #if self.grad_scaler is not None:
+        #    self.grad_scaler.scale(l).backward()
+        #    self.grad_scaler.unscale_(self.optimizer)
+        #    torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+        #    self.grad_scaler.step(self.optimizer)
+        #    self.grad_scaler.update()
+        #else:
+        l.backward()
+        torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+        self.optimizer.step()
         return {'loss': l.detach().cpu().numpy()}
 
     def on_train_epoch_end(self, train_outputs: List[dict]):
@@ -1346,7 +1436,7 @@ class con_KDTrainer_CE_T2(nnUNetTrainer):
                                    "forward pass (where compile is triggered) already has deep supervision disabled. "
                                    "This is exactly what we need in perform_actual_validation")
 
-        predictor = nnUNetPredictor(tile_step_size=0.5, use_gaussian=True, use_mirroring=True,
+        predictor = CasePredictor(tile_step_size=0.5, use_gaussian=True, use_mirroring=True,
                                     perform_everything_on_device=True, device=self.device, verbose=False,
                                     verbose_preprocessing=False, allow_tqdm=False)
         predictor.manual_initialization(self.network, self.plans_manager, self.configuration_manager, None,

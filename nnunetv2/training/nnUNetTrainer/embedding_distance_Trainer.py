@@ -46,7 +46,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from nnunetv2.configuration import ANISO_THRESHOLD, default_num_processes
 from nnunetv2.evaluation.evaluate_predictions import compute_metrics_on_folder
 from nnunetv2.inference.export_prediction import export_prediction_from_logits, resample_and_save
-from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
+from nnunetv2.inference.case_predict_from_raw_data import CasePredictor
 from nnunetv2.inference.sliding_window_prediction import compute_gaussian
 from nnunetv2.paths import nnUNet_preprocessed, nnUNet_results
 from nnunetv2.training.data_augmentation.compute_initial_patch_size import get_patch_size
@@ -81,7 +81,7 @@ from threadpoolctl import threadpool_limits
 # -> use KLDiv Loss
 # not working...
 
-class con_KDTrainer_CE_T2(nnUNetTrainer):
+class embedding_distance_Trainer(nnUNetTrainer):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict, unpack_dataset: bool = True,
                  device: torch.device = torch.device('cuda')):
         # From https://grugbrain.dev/. Worth a read ya big brains ;-)
@@ -173,6 +173,8 @@ class con_KDTrainer_CE_T2(nnUNetTrainer):
 
         self.num_input_channels = None  # -> self.initialize()
         self.network = None  # -> self.build_network_architecture()
+        self.cect_embedding = None
+        self.ncct_embedding = None
         self.teacher_network = None
         self.optimizer = self.lr_scheduler = None  # -> self.initialize
         # self.grad_scaler = GradScaler() if self.device.type == 'cuda' else None
@@ -240,10 +242,31 @@ class con_KDTrainer_CE_T2(nnUNetTrainer):
                 self.enable_deep_supervision
             ).to(self.device)
 
+            hightes_feature_nums = self.configuration_manager.network_arch_init_kwargs['features_per_stage'][0]
+            linear_input_size = hightes_feature_nums
+            
+            self.cect_embedding = nn.Sequential(
+                nn.Linear(linear_input_size, linear_input_size // 2),  # 첫 번째 Linear Layer (입력: 512 → 출력: 256)
+                nn.ReLU(),            # 비선형 활성화 함수
+                nn.LayerNorm(linear_input_size // 2),    # Layer Normalization 적용
+                nn.Linear(linear_input_size // 2, linear_input_size // 4),  # 두 번째 Linear Layer (출력: 128)
+                nn.LayerNorm(linear_input_size // 4),    # 최종 Layer Normalization
+                nn.ReLU()
+            ).to(self.device)
+            self.ncct_embedding = nn.Sequential(
+                nn.Linear(linear_input_size, linear_input_size // 2),  # 첫 번째 Linear Layer (입력: 512 → 출력: 256)
+                nn.ReLU(),            # 비선형 활성화 함수
+                nn.LayerNorm(linear_input_size // 2),    # Layer Normalization 적용
+                nn.Linear(linear_input_size // 2, linear_input_size // 4),  # 두 번째 Linear Layer (출력: 128)
+                nn.LayerNorm(linear_input_size // 4),    # 최종 Layer Normalization
+                nn.ReLU()
+            ).to(self.device)
             # compile network for free speedup
             if self._do_i_compile():
                 self.print_to_log_file('Using torch.compile...')
                 self.network = torch.compile(self.network)
+                self.cect_embedding  = torch.compile(self.cect_embedding)
+                self.ncct_embedding  = torch.compile(self.ncct_embedding)
                 self.teacher_network = torch.compile(self.teacher_network)
 
             self.optimizer, self.lr_scheduler = self.configure_optimizers()
@@ -253,7 +276,10 @@ class con_KDTrainer_CE_T2(nnUNetTrainer):
                 self.network = DDP(self.network, device_ids=[self.local_rank])
                 self.teacher_network = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.teacher_network)
                 self.teacher_network = DDP(self.teacher_network, device_ids=[self.local_rank])
-
+                self.cect_embedding = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.cect_embedding)
+                self.cect_embedding = DDP(self.cect_embedding, device_ids=[self.local_rank])
+                self.ncct_embedding = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.ncct_embedding)
+                self.ncct_embedding = DDP(self.ncct_embedding, device_ids=[self.local_rank])
 
             self.loss = self._build_loss()
             self.t_loss = self._build_t_loss()
@@ -1094,13 +1120,20 @@ class con_KDTrainer_CE_T2(nnUNetTrainer):
             student_tumor_feature = student_feature * tumor_mask
             student_tumor_vector = student_tumor_feature.mean(dim=(2,3,4))
 
-            tumor_similarity = torch.nn.functional.cosine_similarity(teacher_tumor_vector, student_tumor_vector, dim=1)
-            kidney_similarity = torch.nn.functional.cosine_similarity(teacher_kidney_vector, student_tumor_vector, dim=1)
-            sim_loss = (1 - tumor_similarity).mean() + torch.nn.functional.relu(kidney_similarity - 0.5).mean()
-            exp_t = torch.exp(tumor_similarity)
-            exp_k = torch.exp(kidney_similarity)
+            embedding_teacher_tumor_vector = self.cect_embedding(teacher_tumor_vector)
+            embedding_teacher_kidney_vector = self.cect_embedding(teacher_kidney_vector)
+            embedding_student_tumor_vector = self.ncct_embedding(student_tumor_vector)
 
-            sim_loss = -1 * torch.log(exp_t.sum(dim=0) / exp_k.sum(dim=0))
+            # dim=1 방향으로 유클리드 거리 계산
+            tumor_distance = torch.norm(embedding_teacher_tumor_vector - embedding_student_tumor_vector, p=2, dim=1)
+            kidney_distance = torch.norm(embedding_teacher_kidney_vector - embedding_student_tumor_vector, p=2, dim=1)
+            
+            batch_size = tumor_distance.size(0)
+            margin = torch.tensor([2] * batch_size,device=self.device)  # Margin을 텐서로 설정
+            tumor_similiar_loss = tumor_distance ** 2
+            kidney_similiar_loss = torch.clamp(margin - kidney_distance, min=0) ** 2 
+            sim_loss = (tumor_similiar_loss.mean() + kidney_similiar_loss.mean()) / 2
+
             # Weight needs to be adjusted
             student_weight = 0.75
             sim_weight = 0.25
@@ -1346,7 +1379,7 @@ class con_KDTrainer_CE_T2(nnUNetTrainer):
                                    "forward pass (where compile is triggered) already has deep supervision disabled. "
                                    "This is exactly what we need in perform_actual_validation")
 
-        predictor = nnUNetPredictor(tile_step_size=0.5, use_gaussian=True, use_mirroring=True,
+        predictor = CasePredictor(tile_step_size=0.5, use_gaussian=True, use_mirroring=True,
                                     perform_everything_on_device=True, device=self.device, verbose=False,
                                     verbose_preprocessing=False, allow_tqdm=False)
         predictor.manual_initialization(self.network, self.plans_manager, self.configuration_manager, None,

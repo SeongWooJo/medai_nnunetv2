@@ -81,7 +81,7 @@ from threadpoolctl import threadpool_limits
 # -> use KLDiv Loss
 # not working...
 
-class con_KDTrainer_CE_T2(nnUNetTrainer):
+class dotproduct_Trainer(nnUNetTrainer):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict, unpack_dataset: bool = True,
                  device: torch.device = torch.device('cuda')):
         # From https://grugbrain.dev/. Worth a read ya big brains ;-)
@@ -1094,9 +1094,8 @@ class con_KDTrainer_CE_T2(nnUNetTrainer):
             student_tumor_feature = student_feature * tumor_mask
             student_tumor_vector = student_tumor_feature.mean(dim=(2,3,4))
 
-            tumor_similarity = torch.nn.functional.cosine_similarity(teacher_tumor_vector, student_tumor_vector, dim=1)
-            kidney_similarity = torch.nn.functional.cosine_similarity(teacher_kidney_vector, student_tumor_vector, dim=1)
-            sim_loss = (1 - tumor_similarity).mean() + torch.nn.functional.relu(kidney_similarity - 0.5).mean()
+            tumor_similarity = torch.sum(teacher_tumor_vector * student_tumor_vector, dim=1)
+            kidney_similarity = torch.sum(teacher_kidney_vector * student_tumor_vector, dim=1)
             exp_t = torch.exp(tumor_similarity)
             exp_k = torch.exp(kidney_similarity)
 
@@ -1106,16 +1105,16 @@ class con_KDTrainer_CE_T2(nnUNetTrainer):
             sim_weight = 0.25
             l = student_weight * student_l + sim_weight * sim_loss
             
-        if self.grad_scaler is not None:
-            self.grad_scaler.scale(l).backward()
-            self.grad_scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
-            self.grad_scaler.step(self.optimizer)
-            self.grad_scaler.update()
-        else:
-            l.backward()
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
-            self.optimizer.step()
+        #if self.grad_scaler is not None:
+        #    self.grad_scaler.scale(l).backward()
+        #    self.grad_scaler.unscale_(self.optimizer)
+        #    torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+        #    self.grad_scaler.step(self.optimizer)
+        #    self.grad_scaler.update()
+        #else:
+        l.backward()
+        torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+        self.optimizer.step()
         return {'loss': l.detach().cpu().numpy()}
 
     def on_train_epoch_end(self, train_outputs: List[dict]):
