@@ -1077,7 +1077,9 @@ class Regioned_KDTrainer_CE_T2(nnUNetTrainer):
                 #print(target_elem.shape)
                 #print(torch.unique(target_elem))
                 mask = torch.isin(target_elem, torch.tensor([1,2],device=self.device))
+                tumor_mask = torch.isin(target_elem, torch.tensor([2],device=self.device))
                 mask_list.append(mask)
+                mask2_list.append(tumor_mask)
             
                 
             student_l = self.loss(student_output, target)               # DC_CE_loss(student network output, gt label)
@@ -1085,6 +1087,7 @@ class Regioned_KDTrainer_CE_T2(nnUNetTrainer):
                 target_mask = mask_list[idx]
                 student_output[idx] = student_output[idx] * target_mask
                 teacher_output[idx] = teacher_output[idx] * target_mask
+
             
             teacher_l = None
             if self.enable_deep_supervision and not self.teacher_enable_deep_supervision:

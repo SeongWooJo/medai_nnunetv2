@@ -1090,7 +1090,7 @@ class pixelwise_cos_similiar_Trainer(nnUNetTrainer):
             teacher_tumor_feature = teacher_feature * tumor_mask
             student_tumor_feature = student_feature * tumor_mask
             
-            random_sample_nums = 100
+            random_sample_nums = 20000
             
             ## tumor, kidney mask를 (batch, depth, height, width)로 압축시키고 그곳에 0이 아닌 positions만 가져옴
             ## tensor(list of list)
@@ -1193,12 +1193,12 @@ class pixelwise_cos_similiar_Trainer(nnUNetTrainer):
                 exp_t = torch.exp(tumor_similarity)
                 exp_k = torch.exp(kidney_similarity)
 
-                sim_loss = -1 /(2*random_sample_nums) * torch.log(exp_t.sum() / exp_k.sum())
+                sim_loss = -1 /(random_sample_nums) * torch.log(exp_t.sum() / exp_k.sum())
             else:
                 sim_loss = 0
             # Weight needs to be adjusted
-            student_weight = 0.75
-            sim_weight = 0.25
+            student_weight = 1
+            sim_weight = 1
             l = student_weight * student_l + sim_weight * sim_loss
             
         if self.grad_scaler is not None and 0:

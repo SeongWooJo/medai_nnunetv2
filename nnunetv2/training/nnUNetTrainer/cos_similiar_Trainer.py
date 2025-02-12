@@ -81,7 +81,7 @@ from threadpoolctl import threadpool_limits
 # -> use KLDiv Loss
 # not working...
 
-class con_similiar_Trainer(nnUNetTrainer):
+class cos_similiar_Trainer(nnUNetTrainer):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict, unpack_dataset: bool = True,
                  device: torch.device = torch.device('cuda')):
         # From https://grugbrain.dev/. Worth a read ya big brains ;-)
@@ -1063,7 +1063,8 @@ class con_similiar_Trainer(nnUNetTrainer):
         
         data_0 = data_0.to(self.device, non_blocking=True)
         data_1 = data_1.to(self.device, non_blocking=True)
-        
+        batch_size = data_0.size(0)
+
         if isinstance(target, list):
             target = [i.to(self.device, non_blocking=True) for i in target]
         else:
@@ -1085,34 +1086,46 @@ class con_similiar_Trainer(nnUNetTrainer):
             
                 
             student_l = self.loss(student_output, target)               # DC_CE_loss(student network output, gt label)
-            #for idx, target_elem in enumerate(target):
-            #    target_mask = mask_list[idx]
-            #    student_output[idx] = student_output[idx] * target_mask
-            #    teacher_output[idx] = teacher_output[idx] * target_mask
+            
+            
+            kidney_positions = kidney_mask.squeeze(dim=1).nonzero(as_tuple=False)
+            tumor_positions = tumor_mask.squeeze(dim=1).nonzero(as_tuple=False)
+            duplicated_list = list(set(torch.unique(kidney_positions[:, 0]).tolist()) & set(torch.unique(tumor_positions[:, 0]).tolist()))
+            if not len(duplicated_list) == 0:
+                for elem in range(batch_size):
+                    if elem not in duplicated_list:
+                        kidney_mask[elem] = 0
+                        tumor_mask[elem] = 0
+            
             teacher_kidney_feature = teacher_feature * kidney_mask
             teacher_kidney_vector = teacher_kidney_feature.mean(dim=(2,3,4))
 
             student_kidney_feature = student_feature * kidney_mask
             student_kidney_vector = student_kidney_feature.mean(dim=(2,3,4))
-            
+
             teacher_tumor_feature = teacher_feature * tumor_mask
             teacher_tumor_vector = teacher_tumor_feature.mean(dim=(2,3,4))
 
             student_tumor_feature = student_feature * tumor_mask
             student_tumor_vector = student_tumor_feature.mean(dim=(2,3,4))
 
+            teacher_tumor_vector = teacher_tumor_vector / (torch.norm(teacher_tumor_vector, p=2, dim=1, keepdim=True) + 1e-8)
+            student_tumor_vector = student_tumor_vector / (torch.norm(student_tumor_vector, p=2, dim=1, keepdim=True) + 1e-8)
+            student_kidney_vector = student_kidney_vector / (torch.norm(student_kidney_vector, p=2, dim=1, keepdim=True) + 1e-8)
+
             tumor_similarity = torch.nn.functional.cosine_similarity(teacher_tumor_vector, student_tumor_vector, dim=1)
-            kidney_similarity = torch.nn.functional.cosine_similarity(teacher_kidney_vector, student_tumor_vector, dim=1)
+            kidney_similarity = torch.nn.functional.cosine_similarity(student_kidney_vector, student_tumor_vector, dim=1)
             exp_t = torch.exp(tumor_similarity)
             exp_k = torch.exp(kidney_similarity)
 
             sim_loss = -1 * torch.log(exp_t.sum(dim=0) / exp_k.sum(dim=0))
+            alpha = self.current_epoch / self.num_epochs
             # Weight needs to be adjusted
-            student_weight = 0.75
-            sim_weight = 0.25
+            student_weight = 1
+            sim_weight = 1 - alpha
             l = student_weight * student_l + sim_weight * sim_loss
             
-        if self.grad_scaler is not None:
+        if self.grad_scaler is not None and 0:
             self.grad_scaler.scale(l).backward()
             self.grad_scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)

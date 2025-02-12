@@ -81,7 +81,7 @@ from threadpoolctl import threadpool_limits
 # -> use KLDiv Loss
 # not working...
 
-class embedding_cos_similiar_Trainer(nnUNetTrainer):
+class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict, unpack_dataset: bool = True,
                  device: torch.device = torch.device('cuda')):
         # From https://grugbrain.dev/. Worth a read ya big brains ;-)
@@ -266,14 +266,6 @@ class embedding_cos_similiar_Trainer(nnUNetTrainer):
                 nn.ReLU()
             ).to(self.device)
             
-            #self.ncct_embedding = nn.Sequential(
-            #    nn.Linear(linear_input_size, linear_input_size // 2),  # 첫 번째 Linear Layer (입력: 512 → 출력: 256)
-            #    nn.ReLU(),            # 비선형 활성화 함수
-            #    nn.LayerNorm(linear_input_size // 2),    # Layer Normalization 적용
-            #    nn.Linear(linear_input_size // 2, linear_input_size // 4),  # 두 번째 Linear Layer (출력: 128)
-            #    nn.LayerNorm(linear_input_size // 4),    # 최종 Layer Normalization
-            #    nn.ReLU()
-            #).to(self.device)
             # compile network for free speedup
             if self._do_i_compile():
                 self.print_to_log_file('Using torch.compile...')
@@ -1097,6 +1089,7 @@ class embedding_cos_similiar_Trainer(nnUNetTrainer):
         
         data_0 = data_0.to(self.device, non_blocking=True)
         data_1 = data_1.to(self.device, non_blocking=True)
+        
         batch_size = data_0.size(0)
         if isinstance(target, list):
             target = [i.to(self.device, non_blocking=True) for i in target]
@@ -1113,52 +1106,126 @@ class embedding_cos_similiar_Trainer(nnUNetTrainer):
             # Forward pass with the student model
             student_output, student_feature = self.network(data_0)                       # NCCT
             
-            
             kidney_mask = torch.isin(target[0], torch.tensor([1],device=self.device))
             tumor_mask = torch.isin(target[0], torch.tensor([2],device=self.device))
+                
+            student_l = self.loss(student_output, target)               # DC_CE_loss(student network output, gt label)
             
+            teacher_kidney_feature = teacher_feature * kidney_mask
+            student_kidney_feature = student_feature * kidney_mask
+            teacher_tumor_feature = teacher_feature * tumor_mask
+            student_tumor_feature = student_feature * tumor_mask
+            
+            random_sample_nums = 20000
+            kidney_pairs_nums = 10
+            pair_mode = True
+            ## tumor, kidney mask를 (batch, depth, height, width)로 압축시키고 그곳에 0이 아닌 positions만 가져옴
+            ## tensor(list of list)
             kidney_positions = kidney_mask.squeeze(dim=1).nonzero(as_tuple=False)
             tumor_positions = tumor_mask.squeeze(dim=1).nonzero(as_tuple=False)
             
             contrast_condition = False
-            duplicated_list = list(set(torch.unique(kidney_positions[:, 0]).tolist()) & set(torch.unique(tumor_positions[:, 0]).tolist()))
-                
-            student_l = self.loss(student_output, target)               # DC_CE_loss(student network output, gt label)
-            #for idx, target_elem in enumerate(target):
-            #    target_mask = mask_list[idx]
-            #    student_output[idx] = student_output[idx] * target_mask
-            #    teacher_output[idx] = teacher_output[idx] * target_mask
+            if not len(list(set(torch.unique(kidney_positions[:, 0]).tolist()) & set(torch.unique(tumor_positions[:, 0]).tolist()))) == 0:
+                contrast_condition = True
             
-            if not len(duplicated_list) == 0:
-                for elem in range(batch_size):
-                    if elem not in duplicated_list:
-                        kidney_mask[elem] = 0
-                        tumor_mask[elem] = 0
-                teacher_kidney_feature = teacher_feature * kidney_mask
-                teacher_kidney_vector = teacher_kidney_feature.mean(dim=(2,3,4))
-
+            if contrast_condition:
+                #print("test")
+                # batch별 인덱스 추출
                 student_kidney_feature = student_feature * kidney_mask
                 embedding_student_kidney_vector = self.ncct_embedding(student_kidney_feature)
-                student_kidney_vector = embedding_student_kidney_vector.mean(dim=(2,3,4))
                 
                 teacher_tumor_feature = teacher_feature * tumor_mask
                 embedding_teacher_tumor_vector = self.cect_embedding(teacher_tumor_feature)
-                teacher_tumor_vector = embedding_teacher_tumor_vector.mean(dim=(2,3,4))
-
+                
                 student_tumor_feature = student_feature * tumor_mask
                 embedding_student_tumor_vector = self.ncct_embedding(student_tumor_feature)
-                student_tumor_vector = embedding_student_tumor_vector.mean(dim=(2,3,4))
+                
+                unique_batches, inverse_indices = torch.unique(kidney_positions[:, 0], return_inverse=True)
+                batch_counts = torch.bincount(inverse_indices)
 
-                teacher_tumor_vector = teacher_tumor_vector / (torch.norm(teacher_tumor_vector, p=2, dim=1, keepdim=True) + 1e-8)
-                student_tumor_vector = student_tumor_vector / (torch.norm(student_tumor_vector, p=2, dim=1, keepdim=True) + 1e-8)
-                student_kidney_vector = student_kidney_vector / (torch.norm(student_kidney_vector, p=2, dim=1, keepdim=True) + 1e-8)
+                kidney_splits = torch.split(kidney_positions, batch_counts.tolist())
+                batch_kidney_positions = {key: torch.empty((0,)) for key in range(batch_size)}  # 모든 key를 기본적으로 빈 리스트로 초기화
 
-                tumor_similarity = torch.nn.functional.cosine_similarity(teacher_tumor_vector, student_tumor_vector, dim=1)
-                kidney_similarity = torch.nn.functional.cosine_similarity(student_kidney_vector, student_tumor_vector, dim=1)
+                batch_kidney_positions.update({unique_batches[i].item(): kidney_splits[i] for i in range(len(unique_batches))})
+                
+                unique_batches, inverse_indices = torch.unique(tumor_positions[:, 0], return_inverse=True)
+                batch_counts = torch.bincount(inverse_indices)
+                tumor_splits = torch.split(tumor_positions, batch_counts.tolist())
+                batch_tumor_positions = {key: torch.empty((0,)) for key in range(batch_size)}  # 모든 key를 기본적으로 빈 리스트로 초기화
+
+                batch_tumor_positions.update({unique_batches[i].item(): tumor_splits[i] for i in range(len(unique_batches))})
+
+                # 각 배치별 벡터 저장 리스트
+                batch_student_kidney_vectors = [torch.empty((0,), device=self.device) for _ in range(batch_size)]
+                batch_teacher_tumor_vectors = [torch.empty((0,), device=self.device) for _ in range(batch_size)]
+                batch_student_tumor_vectors = [torch.empty((0,), device=self.device) for _ in range(batch_size)]
+                batch_expanded_student_tumor_vectors = [torch.empty((0,), device=self.device) for _ in range(batch_size)]
+
+                #batch_tumor_distances = [torch.empty((0,), device=self.device) for _ in range(batch_size)]
+                #batch_kidney_distances = [torch.empty((0,), device=self.device) for _ in range(batch_size)]
+
+                for batch_num in range(0,batch_size):
+                    if len(batch_tumor_positions[batch_num]) == 0 or len(batch_kidney_positions[batch_num]) == 0:
+                        continue
+                    tumor_idx = torch.randint(0, len(batch_tumor_positions[batch_num]), (random_sample_nums,), device=self.device)
+                    expanded_tumor_idx = tumor_idx.unsqueeze(1).expand(-1, kidney_pairs_nums).reshape(-1)
+                    #tumor_idx2 = torch.randint(0, len(batch_tumor_positions[batch_num]), (random_sample_nums * kidney_pairs_nums,), device=self.device)
+                    
+                    expanded_tumor_pos = batch_tumor_positions[batch_num][expanded_tumor_idx]
+                    sample_tumor_pos2 = batch_tumor_positions[batch_num][tumor_idx]
+                    #sample_tumor_pos2 = batch_tumor_positions[batch_num][tumor_idx2]
+                    tumor_depth_idx, tumor_height_idx, tumor_width_idx = sample_tumor_pos2[:, 1], sample_tumor_pos2[:, 2], sample_tumor_pos2[:, 3]
+                        
+                    if pair_mode:
+                        teacher_tumor_vector = embedding_teacher_tumor_vector[batch_num, :, tumor_depth_idx, tumor_height_idx, tumor_width_idx].T
+                        student_tumor_vector = embedding_student_tumor_vector[batch_num, :, tumor_depth_idx, tumor_height_idx, tumor_width_idx].T
+                        batch_teacher_tumor_vectors[batch_num] = teacher_tumor_vector
+                        batch_student_tumor_vectors[batch_num] = student_tumor_vector
+                    else: ## 모든 tumor를 평균과 비교하는 경우
+                        teacher_tumor_vector = embedding_teacher_tumor_vector[batch_num].mean(dim=(1,2,3)).unsqueeze(1).expand(-1, random_sample_nums).T
+                        student_tumor_vector = embedding_student_tumor_vector[batch_num, :, tumor_depth_idx, tumor_height_idx, tumor_width_idx].T
+                        batch_teacher_tumor_vectors[batch_num] = teacher_tumor_vector
+                        batch_student_tumor_vectors[batch_num] = student_tumor_vector
+                    
+                    kidney_idx = torch.randint(0, len(batch_kidney_positions[batch_num]), (random_sample_nums * kidney_pairs_nums,), device=self.device)
+                    sample_kidney_pos = batch_kidney_positions[batch_num][kidney_idx]
+                    
+                    kidney_depth_idx, kidney_height_idx, kidney_width_idx = sample_kidney_pos[:, 1], sample_kidney_pos[:, 2], sample_kidney_pos[:, 3]
+                    e_tumor_depth_idx, e_tumor_height_idx, e_tumor_width_idx = expanded_tumor_pos[:, 1], expanded_tumor_pos[:, 2], expanded_tumor_pos[:, 3]
+                    
+                    student_kidney_vector = embedding_student_kidney_vector[batch_num, :, kidney_depth_idx, kidney_height_idx, kidney_width_idx].T  # (c,)
+                    expanded_student_tumor_vector = embedding_student_tumor_vector[batch_num, :, e_tumor_depth_idx, e_tumor_height_idx, e_tumor_width_idx].T
+
+                    #kidney_distances = torch.sqrt(
+                    #    (e_tumor_depth_idx - kidney_depth_idx) ** 2 +
+                    #    (e_tumor_height_idx - kidney_height_idx) ** 2 +
+                    #    (e_tumor_width_idx - kidney_width_idx) ** 2
+                    #)
+                    #kidney_min, kidney_max = torch.aminmax(kidney_distances, dim=0)
+                    #kidney_distances_norm = None
+                    #if kidney_min == kidney_max:
+                    #    kidney_distances_norm = torch.ones(random_sample_nums, device=self.device) * (1/random_sample_nums)
+                    #else:
+                    #    kidney_distances_norm = 1 - (kidney_distances - kidney_min) / (kidney_max - kidney_min)
+                    #batch_kidney_distances[batch_num] = kidney_distances_norm
+                    
+                    batch_expanded_student_tumor_vectors[batch_num] = expanded_student_tumor_vector
+                    batch_student_kidney_vectors[batch_num] = student_kidney_vector
+                # 리스트 -> 텐서 변환 (각 batch별로 쌓기)
+                teacher_kidney_tensor = torch.cat([v for v in batch_student_kidney_vectors if not len(v) == 0], dim=0)
+                expanded_student_tumor_tensor = torch.cat([v for v in batch_expanded_student_tumor_vectors if not len(v) == 0], dim=0)
+                teacher_tumor_tensor = torch.cat([v for v in batch_teacher_tumor_vectors if not len(v) == 0], dim=0)
+                student_tumor_tensor = torch.cat([v for v in batch_student_tumor_vectors if not len(v) == 0], dim=0)
+
+                #tumor_distance_tensor = torch.cat([v for v in batch_tumor_distances if not len(v) == 0], dim=0)
+                #kidney_distance_tensor = torch.cat([v for v in batch_kidney_distances if not len(v) == 0], dim=0)
+
+                tumor_similarity = torch.nn.functional.cosine_similarity(teacher_tumor_tensor, student_tumor_tensor, dim=-1)
+                kidney_similarity = torch.nn.functional.cosine_similarity(teacher_kidney_tensor, expanded_student_tumor_tensor, dim=-1)
                 exp_t = torch.exp(tumor_similarity)
                 exp_k = torch.exp(kidney_similarity)
 
-                sim_loss = -1 * torch.log(exp_t.sum(dim=0) / exp_k.sum(dim=0))
+                sim_loss = -1 /(random_sample_nums) * torch.log(exp_t.sum() / exp_k.sum())
             else:
                 sim_loss = 0
             # Weight needs to be adjusted
@@ -1166,7 +1233,7 @@ class embedding_cos_similiar_Trainer(nnUNetTrainer):
             sim_weight = 1
             l = student_weight * student_l + sim_weight * sim_loss
             
-        if self.grad_scaler is not None:
+        if self.grad_scaler is not None and 0:
             self.grad_scaler.scale(l).backward()
             self.grad_scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
