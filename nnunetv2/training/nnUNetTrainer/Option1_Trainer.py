@@ -46,7 +46,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from nnunetv2.configuration import ANISO_THRESHOLD, default_num_processes
 from nnunetv2.evaluation.evaluate_predictions import compute_metrics_on_folder
 from nnunetv2.inference.export_prediction import export_prediction_from_logits, resample_and_save
-from nnunetv2.inference.feature3_predict_from_raw_data import Feature3Predictor
+from nnunetv2.inference.option_predict_from_raw_data import OptionPredictor
 from nnunetv2.inference.ignore_predict_from_raw_data import IgnorePredictor
 from nnunetv2.inference.sliding_window_prediction import compute_gaussian
 from nnunetv2.paths import nnUNet_preprocessed, nnUNet_results
@@ -1439,7 +1439,7 @@ class Option1_Trainer(nnUNetTrainer):
                                    "forward pass (where compile is triggered) already has deep supervision disabled. "
                                    "This is exactly what we need in perform_actual_validation")
 
-        predictor = Feature3Predictor(tile_step_size=0.5, use_gaussian=True, use_mirroring=True,
+        predictor = OptionPredictor(tile_step_size=0.5, use_gaussian=True, use_mirroring=True,
                                      perform_everything_on_device=True, device=self.device, verbose=False,
                                      verbose_preprocessing=False, allow_tqdm=False)
         #predictor = IgnorePredictor(tile_step_size=0.5, use_gaussian=True, use_mirroring=True,
@@ -1485,7 +1485,7 @@ class Option1_Trainer(nnUNetTrainer):
 
                 self.print_to_log_file(f"predicting {k}")
                 data, seg, properties = dataset_val.load_case(k)
-                # data = data[0:1, :, :, :]
+                data = data[0:1, :, :, :]
                 cascade_data = seg[1:2, :, :, :]
                 data = np.vstack((data, cascade_data))
                 cascade_data = torch.from_numpy(cascade_data)

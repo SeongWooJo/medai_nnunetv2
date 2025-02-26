@@ -86,7 +86,7 @@ from collections import deque
 # -> use KLDiv Loss
 # not working...
 
-class Option2_Trainer(nnUNetTrainer):
+class Option2_fold0_Trainer(nnUNetTrainer):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict, unpack_dataset: bool = True,
                  device: torch.device = torch.device('cuda')):
         # From https://grugbrain.dev/. Worth a read ya big brains ;-)

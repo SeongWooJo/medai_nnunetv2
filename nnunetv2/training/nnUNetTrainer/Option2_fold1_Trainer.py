@@ -86,7 +86,7 @@ from collections import deque
 # -> use KLDiv Loss
 # not working...
 
-class Option2_Trainer(nnUNetTrainer):
+class Option2_fold1_Trainer(nnUNetTrainer):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict, unpack_dataset: bool = True,
                  device: torch.device = torch.device('cuda')):
         # From https://grugbrain.dev/. Worth a read ya big brains ;-)
@@ -390,7 +390,7 @@ class Option2_Trainer(nnUNetTrainer):
                                    enable_deep_supervision: bool = True,
                                    embedding_kwargs: dict = None) -> nn.Module:
         
-        pretrain_network = torch.load("/data/seongwoo/nnunetFrame/nnunet_results/Dataset602_Kits19_fg_concat_CECT/IgnoreTrainer__nnUNetPlans__3d_cascade_fullres/fold_0/checkpoint_final.pth", weights_only=False)['network_weights']
+        pretrain_network = torch.load("/data/seongwoo/nnunetFrame/nnunet_results/Dataset602_Kits19_fg_concat_CECT/IgnoreTrainer__nnUNetPlans__3d_cascade_fullres/fold_1/checkpoint_final.pth", weights_only=False)['network_weights']
 
         network = get_network_from_plans(
             architecture_class_name,

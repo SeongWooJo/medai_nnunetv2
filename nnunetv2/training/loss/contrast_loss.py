@@ -18,7 +18,7 @@ class KD_ContrastLoss(nn.Module):
         batch_positions.update({unique_batches[i].item(): splits[i] for i in range(len(unique_batches))})
         return batch_positions
     
-    def forward(self, net_output: torch.Tensor, student_feature: torch.Tensor, teacher_feature: torch.Tensor, target: torch.Tensor, kidney_deque: deque):
+    def forward(self, net_output: torch.Tensor, net_teacher_output: torch.Tensor, student_feature: torch.Tensor, teacher_feature: torch.Tensor, target: torch.Tensor, kidney_deque: deque):
         """
         target must be b, c, x, y(, z) with c=1
         :param net_output:
@@ -29,7 +29,7 @@ class KD_ContrastLoss(nn.Module):
         tumor_mask = torch.isin(target, torch.tensor([2],device=net_output.device))
         batch_size = net_output.size(0)
         
-        tumor_pred_mask = torch.isin(torch.argmax(net_output, dim=1, keepdim=True), torch.tensor([1],device=net_output.device))   
+        tumor_pred_mask = torch.isin(torch.argmax(net_teacher_output, dim=1, keepdim=True), torch.tensor([1],device=net_output.device))   
         kidney_pred_mask = torch.isin(torch.argmax(net_output, dim=1, keepdim=True), torch.tensor([0],device=net_output.device))   
         
         tumor_wrong_pred_mask = tumor_mask & ~tumor_pred_mask
