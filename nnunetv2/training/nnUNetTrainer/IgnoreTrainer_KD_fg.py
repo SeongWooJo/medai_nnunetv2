@@ -40,13 +40,14 @@ from torch import autocast, nn
 from torch import distributed as dist
 from torch._dynamo import OptimizedModule
 from torch.cuda import device_count
-from torch.amp import GradScaler
+from torch.cuda.amp import GradScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from nnunetv2.configuration import ANISO_THRESHOLD, default_num_processes
 from nnunetv2.evaluation.evaluate_predictions import compute_metrics_on_folder
 from nnunetv2.inference.export_prediction import export_prediction_from_logits, resample_and_save
-from nnunetv2.inference.case_predict_from_raw_data import CasePredictor
+from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
+from nnunetv2.inference.ignore_predict_from_raw_data import IgnorePredictor
 from nnunetv2.inference.sliding_window_prediction import compute_gaussian
 from nnunetv2.paths import nnUNet_preprocessed, nnUNet_results
 from nnunetv2.training.data_augmentation.compute_initial_patch_size import get_patch_size
@@ -55,7 +56,7 @@ from nnunetv2.training.dataloading.data_loader_3d import nnUNetDataLoader3D
 from nnunetv2.training.dataloading.nnunet_dataset import nnUNetDataset
 from nnunetv2.training.dataloading.utils import get_case_identifiers, unpack_dataset
 from nnunetv2.training.logging.nnunet_logger import nnUNetLogger
-from nnunetv2.training.loss.compound_losses import DC_and_CE_loss, DC_and_BCE_loss
+from nnunetv2.training.loss.compound_losses import DC_and_CE_loss, DC_and_CE_loss2, DC_and_BCE_loss
 from nnunetv2.training.loss.deep_supervision import DeepSupervisionWrapper
 from nnunetv2.training.loss.dice import get_tp_fp_fn_tn, MemoryEfficientSoftDiceLoss
 from nnunetv2.training.lr_scheduler.polylr import PolyLRScheduler
@@ -69,19 +70,9 @@ from nnunetv2.utilities.label_handling.label_handling import convert_labelmap_to
 from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
 from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
 
-from nnunetv2.training.loss.compound_losses import KD_CE_loss
-import os
-from datetime import datetime
-from threadpoolctl import threadpool_limits
+from nnunetv2.training.loss.compound_losses import KD_KLDiv_loss
 
-# from torch.utils.tensorboard import SummaryWriter
-
-# FP32
-# -> turn off autocast, grad_scaler
-# -> use KLDiv Loss
-# not working...
-
-class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
+class IgnoreTrainer_KD_fg(nnUNetTrainer):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict, unpack_dataset: bool = True,
                  device: torch.device = torch.device('cuda')):
         # From https://grugbrain.dev/. Worth a read ya big brains ;-)
@@ -164,8 +155,7 @@ class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
         self.num_epochs = 1000
         self.current_epoch = 0
         self.enable_deep_supervision = True
-        self.teacher_enable_deep_supervision = True
-        
+
         ### Dealing with labels/regions
         self.label_manager = self.plans_manager.get_label_manager(dataset_json)
         # labels can either be a list of int (regular training) or a list of tuples of int (region-based training)
@@ -173,12 +163,9 @@ class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
 
         self.num_input_channels = None  # -> self.initialize()
         self.network = None  # -> self.build_network_architecture()
-        self.cect_embedding = None
-        self.ncct_embedding = None
         self.teacher_network = None
         self.optimizer = self.lr_scheduler = None  # -> self.initialize
-        # self.grad_scaler = GradScaler() if self.device.type == 'cuda' else None
-        self.grad_scaler = None
+        self.grad_scaler = GradScaler() if self.device.type == 'cuda' else None
         self.loss = None  # -> self.initialize
 
         ### Simple logging. Don't take that away from me!
@@ -228,8 +215,8 @@ class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
                 self.configuration_manager.network_arch_class_name,
                 self.configuration_manager.network_arch_init_kwargs,
                 self.configuration_manager.network_arch_init_kwargs_req_import,
-                1,
-                self.label_manager.num_segmentation_heads,
+                2,
+                self.label_manager.num_segmentation_heads - 1,
                 self.enable_deep_supervision
             ).to(self.device)
 
@@ -237,41 +224,15 @@ class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
                 self.configuration_manager.network_arch_class_name,
                 self.configuration_manager.network_arch_init_kwargs,
                 self.configuration_manager.network_arch_init_kwargs_req_import,
-                1,
-                self.label_manager.num_segmentation_heads,
+                2,
+                self.label_manager.num_segmentation_heads - 1,
                 self.enable_deep_supervision
             ).to(self.device)
 
-            input_volume_size = self.configuration_manager.patch_size
-            #input_nums = 1
-            #for elem in input_volume_size:
-            #    input_nums *= elem 
-            hightes_feature_nums = self.configuration_manager.network_arch_init_kwargs['features_per_stage'][0]
-            #linear_input_size = hightes_feature_nums
-            
-            self.cect_embedding = nn.Sequential(
-                nn.Conv3d(hightes_feature_nums, hightes_feature_nums // 2, 1, 1, 0),  # 첫 번째 Linear Layer (입력: 512 → 출력: 256)
-                nn.ReLU(),            # 비선형 활성화 함수
-                nn.LayerNorm(normalized_shape=(hightes_feature_nums // 2, *input_volume_size)),    # Layer Normalization 적용
-                nn.Conv3d(hightes_feature_nums // 2, hightes_feature_nums // 4, 1, 1, 0),  # 두 번째 Linear Layer (출력: 128)
-                nn.LayerNorm(normalized_shape=(hightes_feature_nums // 4, *input_volume_size)),    # 최종 Layer Normalization
-                nn.ReLU()
-            ).to(self.device)
-            self.ncct_embedding = nn.Sequential(
-                nn.Conv3d(hightes_feature_nums, hightes_feature_nums // 2, 1, 1, 0),  # 첫 번째 Linear Layer (입력: 512 → 출력: 256)
-                nn.ReLU(),            # 비선형 활성화 함수
-                nn.LayerNorm(normalized_shape=(hightes_feature_nums // 2, *input_volume_size)),    # Layer Normalization 적용
-                nn.Conv3d(hightes_feature_nums // 2, hightes_feature_nums // 4, 1, 1, 0),  # 두 번째 Linear Layer (출력: 128)
-                nn.LayerNorm(normalized_shape=(hightes_feature_nums // 4, *input_volume_size)),    # 최종 Layer Normalization
-                nn.ReLU()
-            ).to(self.device)
-            
             # compile network for free speedup
             if self._do_i_compile():
                 self.print_to_log_file('Using torch.compile...')
                 self.network = torch.compile(self.network)
-                self.cect_embedding  = torch.compile(self.cect_embedding)
-                self.ncct_embedding  = torch.compile(self.ncct_embedding)
                 self.teacher_network = torch.compile(self.teacher_network)
 
             self.optimizer, self.lr_scheduler = self.configure_optimizers()
@@ -281,12 +242,6 @@ class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
                 self.network = DDP(self.network, device_ids=[self.local_rank])
                 self.teacher_network = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.teacher_network)
                 self.teacher_network = DDP(self.teacher_network, device_ids=[self.local_rank])
-                self.cect_embedding = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.cect_embedding)
-                self.cect_embedding = DDP(self.cect_embedding, device_ids=[self.local_rank])
-                self.ncct_embedding = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.ncct_embedding)
-                self.ncct_embedding = DDP(self.ncct_embedding, device_ids=[self.local_rank])
-                
-
 
             self.loss = self._build_loss()
             self.t_loss = self._build_t_loss()
@@ -368,7 +323,25 @@ class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
                                    num_input_channels: int,
                                    num_output_channels: int,
                                    enable_deep_supervision: bool = True) -> nn.Module:
+        """
+        This is where you build the architecture according to the plans. There is no obligation to use
+        get_network_from_plans, this is just a utility we use for the nnU-Net default architectures. You can do what
+        you want. Even ignore the plans and just return something static (as long as it can process the requested
+        patch size)
+        but don't bug us with your bugs arising from fiddling with this :-P
+        This is the function that is called in inference as well! This is needed so that all network architecture
+        variants can be loaded at inference time (inference will use the same nnUNetTrainer that was used for
+        training, so if you change the network architecture during training by deriving a new trainer class then
+        inference will know about it).
 
+        If you need to know how many segmentation outputs your custom architecture needs to have, use the following snippet:
+        > label_manager = plans_manager.get_label_manager(dataset_json)
+        > label_manager.num_segmentation_heads
+        (why so complicated? -> We can have either classical training (classes) or regions. If we have regions,
+        the number of outputs is != the number of classes. Also there is the ignore label for which no output
+        should be generated. label_manager takes care of all that for you.)
+
+        """
         return get_network_from_plans(
             architecture_class_name,
             arch_init_kwargs,
@@ -386,7 +359,7 @@ class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
                                    num_output_channels: int,
                                    enable_deep_supervision: bool = True) -> nn.Module:
         
-        pretrain_network = torch.load("/data/nnUNet_Dataset/nnUNet_results/Dataset503_Kits19KD_CECT/nnUNetTrainer__nnUNetPlans__3d_fullres/fold_0/checkpoint_final.pth", weights_only=False)['network_weights']
+        pretrain_network = torch.load("/data/seongwoo/nnunetFrame/nnunet_results/Dataset602_Kits19_fg_concat_CECT/IgnoreTrainer__nnUNetPlans__3d_cascade_fullres/fold_0/checkpoint_final.pth")['network_weights']
 
         network = get_network_from_plans(
             architecture_class_name,
@@ -503,15 +476,15 @@ class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
             loss = DeepSupervisionWrapper(loss, weights)
 
         return loss
-    
+
     def _build_t_loss(self):
 
-        loss = KD_CE_loss(reduction = 'mean', temperature = 2)
+        loss = KD_KLDiv_loss(reduction='mean', temperature=5)
 
         # if self._do_i_compile():
         #     loss.dc = torch.compile(loss.dc)
 
-        if self.enable_deep_supervision and self.teacher_enable_deep_supervision:
+        if self.enable_deep_supervision:
             deep_supervision_scales = self._get_deep_supervision_scales()
             weights = np.array([1 / (2 ** i) for i in range(len(deep_supervision_scales))])
             if self.is_ddp and not self._do_i_compile():
@@ -607,7 +580,7 @@ class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
             self.print_to_log_file('These are the global plan.json settings:\n', dct, '\n', add_timestamp=False)
 
     def configure_optimizers(self):
-        optimizer = torch.optim.SGD(list(self.network.parameters()) + list(self.cect_embedding.parameters()) + list(self.ncct_embedding.parameters()), self.initial_lr, weight_decay=self.weight_decay,
+        optimizer = torch.optim.SGD(self.network.parameters(), self.initial_lr, weight_decay=self.weight_decay,
                                     momentum=0.99, nesterov=True)
         lr_scheduler = PolyLRScheduler(optimizer, self.initial_lr, self.num_epochs)
         return optimizer, lr_scheduler
@@ -909,34 +882,6 @@ class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
         transforms.append(
             RemoveLabelTansform(-1, 0)
         )
-        if is_cascaded:
-            assert foreground_labels is not None, 'We need foreground_labels for cascade augmentations'
-            transforms.append(
-                MoveSegAsOneHotToDataTransform(
-                    source_channel_idx=1,
-                    all_labels=foreground_labels,
-                    remove_channel_from_source=True
-                )
-            )
-            transforms.append(
-                RandomTransform(
-                    ApplyRandomBinaryOperatorTransform(
-                        channel_idx=list(range(-len(foreground_labels), 0)),
-                        strel_size=(1, 8),
-                        p_per_label=1
-                    ), apply_probability=0.4
-                )
-            )
-            transforms.append(
-                RandomTransform(
-                    RemoveRandomConnectedComponentFromOneHotEncodingTransform(
-                        channel_idx=list(range(-len(foreground_labels), 0)),
-                        fill_with_other_class_p=0,
-                        dont_do_if_covers_more_than_x_percent=0.15,
-                        p_per_label=1
-                    ), apply_probability=0.2
-                )
-            )
 
         if regions is not None:
             # the ignore label must also be converted
@@ -964,15 +909,6 @@ class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
         transforms.append(
             RemoveLabelTansform(-1, 0)
         )
-
-        if is_cascaded:
-            transforms.append(
-                MoveSegAsOneHotToDataTransform(
-                    source_channel_idx=1,
-                    all_labels=foreground_labels,
-                    remove_channel_from_source=True
-                )
-            )
 
         if regions is not None:
             # the ignore label must also be converted
@@ -1081,160 +1017,107 @@ class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
         self.logger.log('lrs', self.optimizer.param_groups[0]['lr'], self.current_epoch)
 
     def train_step(self, batch: dict) -> dict:
-        data = batch['data']
-        target = batch['target']
-
-        data_0 = data[:, 0:1, :, :, :]  # B x 1 x D x W x H, NCCT, for student training
-        data_1 = data[:, 1:2, :, :, :]  # B x 1 x D x W x H, CECT, for teacher validation
+        temp_data = batch['data']
+        temp_target = batch['target']
+        
+        target = [target_elem[:, 0:1, :, :, :] for target_elem in temp_target]
+        cascade_mask = [target_elem[:, 1:2, :, :, :] for target_elem in temp_target]
+        #print(temp_target[0].shape)
+        data_0 = torch.cat([temp_data[:, 0:1, :, :, :], cascade_mask[0]], dim=1)   # NCCT ch0 + cascade img
+        data_1 = torch.cat([temp_data[:, 1:2, :, :, :], cascade_mask[0]], dim=1)   # CECT ch1+ cascade img
         
         data_0 = data_0.to(self.device, non_blocking=True)
         data_1 = data_1.to(self.device, non_blocking=True)
-        
-        batch_size = data_0.size(0)
+
         if isinstance(target, list):
             target = [i.to(self.device, non_blocking=True) for i in target]
+            cascade_mask = [i.to(self.device, non_blocking=True) for i in cascade_mask]
         else:
             target = target.to(self.device, non_blocking=True)
+            cascade_mask = cascade_mask.to(self.device, non_blocking=True)
 
-        self.optimizer.zero_grad(set_to_none=True)  # for back propagation?
 
-        with autocast(self.device.type, enabled=True) if 0 else dummy_context():
+        self.optimizer.zero_grad(set_to_none=True)
+        # Autocast can be annoying
+        # If the device_type is 'cpu' then it's slow as heck and needs to be disabled.
+        # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
+        # So autocast will only be active if we have a cuda device.
+        with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
             # Forward pass with the teacher model - do not save gradients here as we do not change the teacher's weights
             with torch.no_grad():
-                teacher_output, teacher_feature = self.teacher_network(data_1)           # CECT
-            
+                temp_output_1 = self.teacher_network(data_1)    # CECT teacher
+
             # Forward pass with the student model
-            student_output, student_feature = self.network(data_0)                       # NCCT
+            temp_output_0 = self.network(data_0)    # NCCT student
             
-
-            kidney_mask = torch.isin(target[0], torch.tensor([1],device=self.device))
-            tumor_mask = torch.isin(target[0], torch.tensor([2],device=self.device))
- 
-            student_l = self.loss(student_output, target)               # DC_CE_loss(student network output, gt label)
+            foreground_output_0 = [torch.where(
+                                    cascade_mask_elem==1, 
+                                    temp_output_elem, 
+                                    torch.full_like(
+                                        temp_output_elem, 
+                                        ##float('-inf'),
+                                        -100, 
+                                        dtype=torch.float32
+                                        )
+                                    )
+                                    for cascade_mask_elem, temp_output_elem in zip(cascade_mask, temp_output_0)]
+            foreground_output_1 = [torch.where(
+                                    cascade_mask_elem==1, 
+                                    temp_output_elem, 
+                                    torch.full_like(
+                                        temp_output_elem, 
+                                        ##float('-inf'),
+                                        -100, 
+                                        dtype=torch.float32
+                                        )
+                                    )
+                                    for cascade_mask_elem, temp_output_elem in zip(cascade_mask, temp_output_1)]
             
-            teacher_kidney_feature = teacher_feature * kidney_mask
-            student_kidney_feature = student_feature * kidney_mask
-            teacher_tumor_feature = teacher_feature * tumor_mask
-            student_tumor_feature = student_feature * tumor_mask
+            output_0 = [torch.cat([torch.where(
+                                    cascade_mask_elem==1, 
+                                    torch.full_like(
+                                        cascade_mask_elem, 
+                                        ##float('-inf'),
+                                        -100,
+                                        dtype=torch.float32
+                                        ), 
+                                    torch.zeros_like(
+                                        cascade_mask_elem, 
+                                        dtype=torch.float32
+                                        )
+                                    ),
+                                    foreground_output_elem], dim=1) for cascade_mask_elem, foreground_output_elem in zip(cascade_mask,foreground_output_0)]
             
-            random_sample_nums = 20000
-            kidney_pairs_nums = 10
-            pair_mode = True
-            ## tumor, kidney mask를 (batch, depth, height, width)로 압축시키고 그곳에 0이 아닌 positions만 가져옴
-            ## tensor(list of list)
-            kidney_positions = kidney_mask.squeeze(dim=1).nonzero(as_tuple=False)
-            tumor_positions = tumor_mask.squeeze(dim=1).nonzero(as_tuple=False)
-            
-            contrast_condition = False
-            if not len(list(set(torch.unique(kidney_positions[:, 0]).tolist()) & set(torch.unique(tumor_positions[:, 0]).tolist()))) == 0:
-                contrast_condition = True
-            
-            if contrast_condition:
-                #print("test")
-                # batch별 인덱스 추출
-                student_kidney_feature = student_feature * kidney_mask
-                embedding_student_kidney_vector = self.ncct_embedding(student_kidney_feature)
-                
-                teacher_tumor_feature = teacher_feature * tumor_mask
-                embedding_teacher_tumor_vector = self.cect_embedding(teacher_tumor_feature)
-                
-                student_tumor_feature = student_feature * tumor_mask
-                embedding_student_tumor_vector = self.ncct_embedding(student_tumor_feature)
-                
-                unique_batches, inverse_indices = torch.unique(kidney_positions[:, 0], return_inverse=True)
-                batch_counts = torch.bincount(inverse_indices)
+            output_1 = [torch.cat([torch.where(
+                                    cascade_mask_elem==1, 
+                                    torch.full_like(
+                                        cascade_mask_elem, 
+                                        ##float('-inf'),
+                                        -100,
+                                        dtype=torch.float32
+                                        ), 
+                                    torch.zeros_like(
+                                        cascade_mask_elem, 
+                                        dtype=torch.float32
+                                        )
+                                    ),
+                                    foreground_output_elem], dim=1) for cascade_mask_elem, foreground_output_elem in zip(cascade_mask,foreground_output_1)]            
 
-                kidney_splits = torch.split(kidney_positions, batch_counts.tolist())
-                batch_kidney_positions = {key: torch.empty((0,)) for key in range(batch_size)}  # 모든 key를 기본적으로 빈 리스트로 초기화
+            # del data
+            # l = self.loss(output, target)
+            student_l = self.loss(output_0, target)         # (student network output, gt label), DC_CE_loss
+            teacher_l = self.t_loss(output_0, output_1)     # (student output, teacher output), KD loss
 
-                batch_kidney_positions.update({unique_batches[i].item(): kidney_splits[i] for i in range(len(unique_batches))})
-                
-                unique_batches, inverse_indices = torch.unique(tumor_positions[:, 0], return_inverse=True)
-                batch_counts = torch.bincount(inverse_indices)
-                tumor_splits = torch.split(tumor_positions, batch_counts.tolist())
-                batch_tumor_positions = {key: torch.empty((0,)) for key in range(batch_size)}  # 모든 key를 기본적으로 빈 리스트로 초기화
-
-                batch_tumor_positions.update({unique_batches[i].item(): tumor_splits[i] for i in range(len(unique_batches))})
-
-                # 각 배치별 벡터 저장 리스트
-                batch_student_kidney_vectors = [torch.empty((0,), device=self.device) for _ in range(batch_size)]
-                batch_teacher_tumor_vectors = [torch.empty((0,), device=self.device) for _ in range(batch_size)]
-                batch_student_tumor_vectors = [torch.empty((0,), device=self.device) for _ in range(batch_size)]
-                batch_expanded_student_tumor_vectors = [torch.empty((0,), device=self.device) for _ in range(batch_size)]
-
-                #batch_tumor_distances = [torch.empty((0,), device=self.device) for _ in range(batch_size)]
-                #batch_kidney_distances = [torch.empty((0,), device=self.device) for _ in range(batch_size)]
-
-                for batch_num in range(0,batch_size):
-                    if len(batch_tumor_positions[batch_num]) == 0 or len(batch_kidney_positions[batch_num]) == 0:
-                        continue
-                    tumor_idx = torch.randint(0, len(batch_tumor_positions[batch_num]), (random_sample_nums,), device=self.device)
-                    expanded_tumor_idx = tumor_idx.unsqueeze(1).expand(-1, kidney_pairs_nums).reshape(-1)
-                    #tumor_idx2 = torch.randint(0, len(batch_tumor_positions[batch_num]), (random_sample_nums * kidney_pairs_nums,), device=self.device)
-                    
-                    expanded_tumor_pos = batch_tumor_positions[batch_num][expanded_tumor_idx]
-                    sample_tumor_pos2 = batch_tumor_positions[batch_num][tumor_idx]
-                    #sample_tumor_pos2 = batch_tumor_positions[batch_num][tumor_idx2]
-                    tumor_depth_idx, tumor_height_idx, tumor_width_idx = sample_tumor_pos2[:, 1], sample_tumor_pos2[:, 2], sample_tumor_pos2[:, 3]
-                        
-                    if pair_mode:
-                        teacher_tumor_vector = embedding_teacher_tumor_vector[batch_num, :, tumor_depth_idx, tumor_height_idx, tumor_width_idx].T
-                        student_tumor_vector = embedding_student_tumor_vector[batch_num, :, tumor_depth_idx, tumor_height_idx, tumor_width_idx].T
-                        batch_teacher_tumor_vectors[batch_num] = teacher_tumor_vector
-                        batch_student_tumor_vectors[batch_num] = student_tumor_vector
-                    else: ## 모든 tumor를 평균과 비교하는 경우
-                        teacher_tumor_vector = embedding_teacher_tumor_vector[batch_num].mean(dim=(1,2,3)).unsqueeze(1).expand(-1, random_sample_nums).T
-                        student_tumor_vector = embedding_student_tumor_vector[batch_num, :, tumor_depth_idx, tumor_height_idx, tumor_width_idx].T
-                        batch_teacher_tumor_vectors[batch_num] = teacher_tumor_vector
-                        batch_student_tumor_vectors[batch_num] = student_tumor_vector
-                    
-                    kidney_idx = torch.randint(0, len(batch_kidney_positions[batch_num]), (random_sample_nums * kidney_pairs_nums,), device=self.device)
-                    sample_kidney_pos = batch_kidney_positions[batch_num][kidney_idx]
-                    
-                    kidney_depth_idx, kidney_height_idx, kidney_width_idx = sample_kidney_pos[:, 1], sample_kidney_pos[:, 2], sample_kidney_pos[:, 3]
-                    e_tumor_depth_idx, e_tumor_height_idx, e_tumor_width_idx = expanded_tumor_pos[:, 1], expanded_tumor_pos[:, 2], expanded_tumor_pos[:, 3]
-                    
-                    student_kidney_vector = embedding_student_kidney_vector[batch_num, :, kidney_depth_idx, kidney_height_idx, kidney_width_idx].T  # (c,)
-                    expanded_student_tumor_vector = embedding_student_tumor_vector[batch_num, :, e_tumor_depth_idx, e_tumor_height_idx, e_tumor_width_idx].T
-
-                    #kidney_distances = torch.sqrt(
-                    #    (e_tumor_depth_idx - kidney_depth_idx) ** 2 +
-                    #    (e_tumor_height_idx - kidney_height_idx) ** 2 +
-                    #    (e_tumor_width_idx - kidney_width_idx) ** 2
-                    #)
-                    #kidney_min, kidney_max = torch.aminmax(kidney_distances, dim=0)
-                    #kidney_distances_norm = None
-                    #if kidney_min == kidney_max:
-                    #    kidney_distances_norm = torch.ones(random_sample_nums, device=self.device) * (1/random_sample_nums)
-                    #else:
-                    #    kidney_distances_norm = 1 - (kidney_distances - kidney_min) / (kidney_max - kidney_min)
-                    #batch_kidney_distances[batch_num] = kidney_distances_norm
-                    
-                    batch_expanded_student_tumor_vectors[batch_num] = expanded_student_tumor_vector
-                    batch_student_kidney_vectors[batch_num] = student_kidney_vector
-                # 리스트 -> 텐서 변환 (각 batch별로 쌓기)
-                teacher_kidney_tensor = torch.cat([v for v in batch_student_kidney_vectors if not len(v) == 0], dim=0)
-                expanded_student_tumor_tensor = torch.cat([v for v in batch_expanded_student_tumor_vectors if not len(v) == 0], dim=0)
-                teacher_tumor_tensor = torch.cat([v for v in batch_teacher_tumor_vectors if not len(v) == 0], dim=0)
-                student_tumor_tensor = torch.cat([v for v in batch_student_tumor_vectors if not len(v) == 0], dim=0)
-
-                #tumor_distance_tensor = torch.cat([v for v in batch_tumor_distances if not len(v) == 0], dim=0)
-                #kidney_distance_tensor = torch.cat([v for v in batch_kidney_distances if not len(v) == 0], dim=0)
-
-                tumor_similarity = torch.nn.functional.cosine_similarity(teacher_tumor_tensor, student_tumor_tensor, dim=-1)
-                kidney_similarity = torch.nn.functional.cosine_similarity(teacher_kidney_tensor, expanded_student_tumor_tensor, dim=-1)
-                exp_t = torch.exp(tumor_similarity)
-                exp_k = torch.exp(kidney_similarity)
-
-                sim_loss = -1 /(random_sample_nums) * torch.log(exp_t.sum() / exp_k.sum())
-            else:
-                sim_loss = 0
             # Weight needs to be adjusted
-            student_weight = 1
-            sim_weight = 1
-            l = student_weight * student_l + sim_weight * sim_loss
-            
-        if self.grad_scaler is not None and 0:
+            student_weight = 0.75
+            teacher_weight = 0.25
+            l = student_weight * student_l + teacher_weight * teacher_l
+
+        #print(f"cascade mask : {torch.unique(cascade_mask[0])}")
+        #print(f"output shape : {output[0].shape}")
+        #print(f"target shape : {target[0].shape}")
+        #print(f"target elem : {torch.unique(target[0])}")
+        if self.grad_scaler is not None:
             self.grad_scaler.scale(l).backward()
             self.grad_scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
@@ -1244,7 +1127,10 @@ class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
             l.backward()
             torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
             self.optimizer.step()
-        return {'loss': l.detach().cpu().numpy()}
+        # return {'loss': l.detach().cpu().numpy()}
+        return {'compound loss': l.detach().cpu().numpy(),
+                'student loss': student_l.detach().cpu().numpy(),
+                'teacher loss': teacher_l.detach().cpu().numpy()}
 
     def on_train_epoch_end(self, train_outputs: List[dict]):
         outputs = collate_outputs(train_outputs)
@@ -1254,36 +1140,75 @@ class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
             dist.all_gather_object(losses_tr, outputs['loss'])
             loss_here = np.vstack(losses_tr).mean()
         else:
-            loss_here = np.mean(outputs['loss'])
+            # loss_here = np.mean(outputs['loss'])
+            loss_here = np.mean(outputs['compound loss'])
+            loss_here_student = np.mean(outputs['student loss'])
+            loss_here_teacher = np.mean(outputs['teacher loss'])
 
         self.logger.log('train_losses', loss_here, self.current_epoch)
+        self.logger.log('student_train_losses', loss_here_student, self.current_epoch)
+        self.logger.log('teacher_train_losses', loss_here_teacher, self.current_epoch)
 
     def on_validation_epoch_start(self):
         self.network.eval()
 
     def validation_step(self, batch: dict) -> dict:
-        data = batch['data']
-        target = batch['target']
+        temp_data = batch['data']
+        temp_target = batch['target']
+        
+        target = [target_elem[:, 0:1, :, :, :] for target_elem in temp_target]
+        cascade_mask = [target_elem[:, 1:2, :, :, :] for target_elem in temp_target]
 
-        data_0 = data[:, 0:1, :, :, :]  # B x 1 x D x W x H, NCCT, for student training -> this goes in 
-        # data_1 = data[:, 1:2, :, :, :]  # B x 1 x D x W x H, CECT, for teacher validation
-        # data_2 = data[:, 2:3, :, :, :]  # B x 1 x D x W x H, ignore_label
-
-        data = data_0.to(self.device, non_blocking=True)
-        # data_1 = data_1.to(self.device, non_blocking=True)
-        # data_2 = data_2.to(self.device, non_blocking=True)
+        data = torch.cat([temp_data[:, 0:1, :, :, :], cascade_mask[0]], dim=1)
+        data = data.to(self.device, non_blocking=True)
 
         if isinstance(target, list):
             target = [i.to(self.device, non_blocking=True) for i in target]
+            cascade_mask = [i.to(self.device, non_blocking=True) for i in cascade_mask]
         else:
             target = target.to(self.device, non_blocking=True)
+            cascade_mask = cascade_mask.to(self.device, non_blocking=True)
 
         # Autocast can be annoying
         # If the device_type is 'cpu' then it's slow as heck and needs to be disabled.
         # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
         # So autocast will only be active if we have a cuda device.
-        with autocast(self.device.type, enabled=True) if 0 else dummy_context():
-            output, _ = self.network(data)
+        with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
+            temp_output = self.network(data)
+            foreground_output = [
+                        torch.where(
+                            cascade_mask_elem==1, 
+                            temp_output_elem, 
+                            torch.full_like(
+                                temp_output_elem, 
+                                #float('-inf'), 
+                                -100,
+                                dtype=torch.float32
+                            )
+                        )
+                        for cascade_mask_elem, temp_output_elem in zip(cascade_mask, temp_output)
+                    ]
+            output = [
+                        torch.cat([
+                            torch.where(
+                                cascade_mask_elem==1, 
+                                torch.full_like(
+                                    cascade_mask_elem, 
+                                    #float('-inf'), 
+                                    -100,
+                                    dtype=torch.float32
+                                ), 
+                                torch.zeros_like(cascade_mask_elem, dtype=torch.float32)
+                            ), 
+                            foreground_output_elem], dim=1) 
+                            for cascade_mask_elem, foreground_output_elem in zip(cascade_mask,foreground_output)
+                    ]
+            
+
+            #normalize_output = [torch.nn.functional.softmax(temp_output_elem, dim=1) for temp_output_elem in temp_output]
+            #foreground_output = [torch.where(cascade_mask_elem==1, normal_output_elem, torch.zeros_like(normal_output_elem)) for cascade_mask_elem, normal_output_elem in zip(cascade_mask, normalize_output)]
+            #output = [torch.cat([1 - cascade_mask_elem, foreground_output_elem], dim=1) for cascade_mask_elem, foreground_output_elem in zip(cascade_mask,foreground_output)]
+            
             del data
             l = self.loss(output, target)
 
@@ -1375,6 +1300,8 @@ class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
         self.logger.log('epoch_end_timestamps', time(), self.current_epoch)
 
         self.print_to_log_file('train_loss', np.round(self.logger.my_fantastic_logging['train_losses'][-1], decimals=4))
+        self.print_to_log_file('student_train_loss', np.round(self.logger.my_fantastic_logging['student_train_losses'][-1], decimals=4))
+        self.print_to_log_file('teacher_train_loss', np.round(self.logger.my_fantastic_logging['teacher_train_losses'][-1], decimals=4))
         self.print_to_log_file('val_loss', np.round(self.logger.my_fantastic_logging['val_losses'][-1], decimals=4))
         self.print_to_log_file('Pseudo dice', [np.round(i, decimals=4) for i in
                                                self.logger.my_fantastic_logging['dice_per_class_or_region'][-1]])
@@ -1474,7 +1401,7 @@ class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
                                    "forward pass (where compile is triggered) already has deep supervision disabled. "
                                    "This is exactly what we need in perform_actual_validation")
 
-        predictor = CasePredictor(tile_step_size=0.5, use_gaussian=True, use_mirroring=True,
+        predictor = IgnorePredictor(tile_step_size=0.5, use_gaussian=True, use_mirroring=True,
                                     perform_everything_on_device=True, device=self.device, verbose=False,
                                     verbose_preprocessing=False, allow_tqdm=False)
         predictor.manual_initialization(self.network, self.plans_manager, self.configuration_manager, None,
@@ -1516,12 +1443,14 @@ class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
                                                                allowed_num_queued=2)
 
                 self.print_to_log_file(f"predicting {k}")
-                data, seg, properties = dataset_val.load_case(k)
-                data = data[0:1, :, :, :]
-
-                if self.is_cascaded:
-                    data = np.vstack((data, convert_labelmap_to_one_hot(seg[-1], self.label_manager.foreground_labels,
-                                                                        output_dtype=data.dtype)))
+                temp_data, seg, properties = dataset_val.load_case(k)
+                cascade_data = seg[1:2, :, :, :]
+                data = np.vstack((temp_data[0:1, :, : ,:], cascade_data))
+                cascade_data = torch.from_numpy(cascade_data)
+                cascade_data = cascade_data.to(self.device, non_blocking=True)
+                #if self.is_cascaded:
+                #    data = np.vstack((data, convert_labelmap_to_one_hot(seg[-1], self.label_manager.foreground_labels,
+                #                                                        output_dtype=data.dtype)))
                 with warnings.catch_warnings():
                     # ignore 'The given NumPy array is not writable' warning
                     warnings.simplefilter("ignore")
@@ -1531,6 +1460,32 @@ class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
                 output_filename_truncated = join(validation_output_folder, k)
 
                 prediction = predictor.predict_sliding_window_return_logits(data)
+                foreground_logits = torch.where(
+                                    cascade_data == 1, 
+                                    prediction, 
+                                    torch.full_like(
+                                        prediction, 
+                                        ##float('-inf'),
+                                        -100, 
+                                        dtype=torch.float32
+                                        )
+                                    ) 
+                                
+                prediction = torch.cat([
+                                torch.where(
+                                    cascade_data == 1, 
+                                    torch.full_like(
+                                        cascade_data, 
+                                        ##float('-inf'),
+                                        -100,
+                                        dtype=torch.float32
+                                    ), 
+                                    torch.zeros_like(
+                                        cascade_data, 
+                                        dtype=torch.float32
+                                    )
+                                ),
+                                foreground_logits], dim=0)
                 prediction = prediction.cpu()
 
                 # this needs to go into background processes
@@ -1611,11 +1566,9 @@ class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
         for epoch in range(self.current_epoch, self.num_epochs):
             self.on_epoch_start()
 
-            # print(f"on_train_epoch_start: epoch {epoch}")
             self.on_train_epoch_start()
             train_outputs = []
             for batch_id in range(self.num_iterations_per_epoch):
-                # print(f"train_step Start: batch {batch_id}")
                 train_outputs.append(self.train_step(next(self.dataloader_train)))
             self.on_train_epoch_end(train_outputs)
 
@@ -1629,98 +1582,3 @@ class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
             self.on_epoch_end()
 
         self.on_train_end()
-
-
-# if __name__ == "__main__":
-
-
-# # class custom_dataloader(nnUNetDataLoader3D):
-#     def generate_train_batch(self):
-#         selected_keys = self.get_indices()
-#         # preallocate memory for data and seg
-#         data_all = np.zeros(self.data_shape, dtype=np.float32)
-#         seg_all = np.zeros(self.seg_shape, dtype=np.int16)
-#         case_properties = []
-
-#         for j, i in enumerate(selected_keys):
-#             # oversampling foreground will improve stability of model training, especially if many patches are empty
-#             # (Lung for example)
-#             force_fg = self.get_do_oversample(j)
-
-#             data, seg, properties = self._data.load_case(i)
-#             case_properties.append(properties)
-
-#             # If we are doing the cascade then the segmentation from the previous stage will already have been loaded by
-#             # self._data.load_case(i) (see nnUNetDataset.load_case)
-#             shape = data.shape[1:]
-#             dim = len(shape)
-#             bbox_lbs, bbox_ubs = self.get_bbox(shape, force_fg, properties['class_locations'])
-
-#             # whoever wrote this knew what he was doing (hint: it was me). We first crop the data to the region of the
-#             # bbox that actually lies within the data. This will result in a smaller array which is then faster to pad.
-#             # valid_bbox is just the coord that lied within the data cube. It will be padded to match the patch size
-#             # later
-#             valid_bbox_lbs = np.clip(bbox_lbs, a_min=0, a_max=None)
-#             valid_bbox_ubs = np.minimum(shape, bbox_ubs)
-
-#             # At this point you might ask yourself why we would treat seg differently from seg_from_previous_stage.
-#             # Why not just concatenate them here and forget about the if statements? Well that's because segneeds to
-#             # be padded with -1 constant whereas seg_from_previous_stage needs to be padded with 0s (we could also
-#             # remove label -1 in the data augmentation but this way it is less error prone)
-#             this_slice = tuple([slice(0, data.shape[0])] + [slice(i, j) for i, j in zip(valid_bbox_lbs, valid_bbox_ubs)])
-#             data = data[this_slice]
-
-#             this_slice = tuple([slice(0, seg.shape[0])] + [slice(i, j) for i, j in zip(valid_bbox_lbs, valid_bbox_ubs)])
-#             seg = seg[this_slice]
-
-#             padding = [(-min(0, bbox_lbs[i]), max(bbox_ubs[i] - shape[i], 0)) for i in range(dim)]
-#             padding = ((0, 0), *padding)
-#             data_all[j] = np.pad(data, padding, 'constant', constant_values=0)
-#             seg_all[j] = np.pad(seg, padding, 'constant', constant_values=-1)
-
-#         if self.transforms is not None:
-#             with torch.no_grad():
-#                 with threadpool_limits(limits=1, user_api=None):
-#                     data_all = torch.from_numpy(data_all).float()
-#                     seg_all = torch.from_numpy(seg_all).to(torch.int16)
-#                     images = []
-#                     segs = []
-
-
-#                     ################## TORCH DEBUG ##################
-#                     # save_dir = '/home/ubuntu/ydh/tensorDebug'
-#                     # if not os.path.exists(save_dir):
-#                     #     os.makedirs(save_dir)
-#                     # timestamp = datetime.now().strftime("%H%M%S")
-
-#                     # data_all_before_path = os.path.join(save_dir, f"data_all_before_{timestamp}.pt")
-#                     # torch.save(data_all, data_all_before_path)
-#                     ################## TORCH DEBUG ##################
-
-
-#                     for b in range(self.batch_size):
-#                         print(f"Batch {b}: data_all[b].shape = {data_all[b].shape}, seg_all[b].shape = {seg_all[b].shape}", flush=True)
-
-#                         tmp0 = self.transforms(**{'image': data_all[b][0:1, :, :, :], 'segmentation': seg_all[b]})
-#                         tmp1 = {'image': data_all[b][1:3, :, :, :]}
-
-#                         print(f"tmp0: {tmp0['image'].shape}", flush=True)
-#                         print(f"tmp1: {tmp1['image'].shape}", flush=True)
-
-#                         tmp_merged = torch.cat([tmp0['image'], tmp1['image']], dim=0)
-#                         images.append(tmp_merged)
-#                         segs.append(tmp0['segmentation'])
-
-#                     data_all = torch.stack(images)
-                    
-#                     # data_all_after_path = os.path.join(save_dir, f"data_all_after_{timestamp}.pt")
-#                     # torch.save(data_all, data_all_after_path)
-
-#                     if isinstance(segs[0], list):
-#                         seg_all = [torch.stack([s[i] for s in segs]) for i in range(len(segs[0]))]
-#                     else:
-#                         seg_all = torch.stack(segs)
-#                     del segs, images
-#             return {'data': data_all, 'target': seg_all, 'keys': selected_keys}
-
-#         return {'data': data_all, 'target': seg_all, 'keys': selected_keys}

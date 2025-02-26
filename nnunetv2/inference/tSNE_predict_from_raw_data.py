@@ -32,10 +32,10 @@ from nnunetv2.utilities.json_export import recursive_fix_for_json_export
 from nnunetv2.utilities.label_handling.label_handling import determine_num_input_channels
 from nnunetv2.utilities.plans_handling.plans_handler import PlansManager, ConfigurationManager
 from nnunetv2.utilities.utils import create_lists_from_splitted_dataset_folder
-from nnunetv2.inference.tSNE_predict_from_raw_data import tSNEPredictor
-from nnunetv2.inference.feature_predict_from_raw_data import FeaturePredictor
 
-class nnUNetPredictor(object):
+
+
+class tSNEPredictor(object):
     def __init__(self,
                  tile_step_size: float = 0.5,
                  use_gaussian: bool = True,
@@ -70,7 +70,7 @@ class nnUNetPredictor(object):
         This is used when making predictions with a trained model
         """
         if use_folds is None:
-            use_folds = nnUNetPredictor.auto_detect_available_folds(model_training_output_dir, checkpoint_name)
+            use_folds = tSNEPredictor.auto_detect_available_folds(model_training_output_dir, checkpoint_name)
 
         dataset_json = load_json(join(model_training_output_dir, 'dataset.json'))
         plans = load_json(join(model_training_output_dir, 'plans.json'))
@@ -100,13 +100,20 @@ class nnUNetPredictor(object):
         if trainer_class is None:
             raise RuntimeError(f'Unable to locate trainer class {trainer_name} in nnunetv2.training.nnUNetTrainer. '
                                f'Please place it there (in any .py file)!')
+
+        embedding_kwargs = {'input_size' : configuration_manager.patch_size,
+                                'features_nums' : configuration_manager.network_arch_init_kwargs['features_per_stage'],
+                                'strides' : configuration_manager.network_arch_init_kwargs['strides'],
+                                'n_stages' : configuration_manager.network_arch_init_kwargs['n_stages']}
+
         network = trainer_class.build_network_architecture(
-            configuration_manager.network_arch_class_name,
+            "dynamic_network_architectures.architectures.predicted_featured_unet.Predicted_Featured_UNet",
             configuration_manager.network_arch_init_kwargs,
             configuration_manager.network_arch_init_kwargs_req_import,
-            num_input_channels,
+            1,
             plans_manager.get_label_manager(dataset_json).num_segmentation_heads,
-            enable_deep_supervision=False
+            enable_deep_supervision=False,
+            embedding_kwargs=embedding_kwargs
         )
 
         self.plans_manager = plans_manager
@@ -256,7 +263,7 @@ class nnUNetPredictor(object):
                                                                                  output_filename_truncated,
                                                                                  num_processes_preprocessing)
 
-        return self.predict_from_data_iterator(data_iterator, save_probabilities, num_processes_segmentation_export)
+        self.predict_from_data_iterator(data_iterator, save_probabilities, num_processes_segmentation_export)
 
     def _internal_get_data_iterator_from_lists_of_filenames(self,
                                                             input_list_of_lists: List[List[str]],
@@ -336,7 +343,7 @@ class nnUNetPredictor(object):
                                                             properties_or_list_of_properties,
                                                             truncated_ofname,
                                                             num_processes)
-        return self.predict_from_data_iterator(iterator, save_probabilities, num_processes_segmentation_export)
+        self.predict_from_data_iterator(iterator, save_probabilities, num_processes_segmentation_export)
 
     def predict_from_data_iterator(self,
                                    data_iterator,
@@ -373,42 +380,22 @@ class nnUNetPredictor(object):
                     sleep(0.1)
                     proceed = not check_workers_alive_and_busy(export_pool, worker_list, r, allowed_num_queued=2)
 
-                prediction = self.predict_logits_from_preprocessed_data(data).cpu()
-
+                original_feature, embedding_feature = self.predict_logits_from_preprocessed_data(data)
+                original_feature = original_feature.cpu()
+                embedding_feature = embedding_feature.cpu()
                 if ofile is not None:
-                    # this needs to go into background processes
-                    # export_prediction_from_logits(prediction, properties, self.configuration_manager, self.plans_manager,
-                    #                               self.dataset_json, ofile, save_probabilities)
-                    print('sending off prediction to background worker for resampling and export')
-                    r.append(
-                        export_pool.starmap_async(
-                            export_prediction_from_logits,
-                            ((prediction, properties, self.configuration_manager, self.plans_manager,
-                              self.dataset_json, ofile, save_probabilities),)
-                        )
-                    )
+                    original_array = original_feature.numpy()
+                    embedded_array = embedding_feature.numpy()
+                    np.savez(ofile + '.npz', origin=original_array, embedding=embedded_array)
+                    #make_graph_from_feature(original_feature, embedding_feature, ofile)
                 else:
-                    # convert_predicted_logits_to_segmentation_with_correct_shape(
-                    #             prediction, self.plans_manager,
-                    #              self.configuration_manager, self.label_manager,
-                    #              properties,
-                    #              save_probabilities)
-
+                    assert("이거 나오면 한강가면 됨")
                     print('sending off prediction to background worker for resampling')
-                    r.append(
-                        export_pool.starmap_async(
-                            convert_predicted_logits_to_segmentation_with_correct_shape, (
-                                (prediction, self.plans_manager,
-                                 self.configuration_manager, self.label_manager,
-                                 properties,
-                                 save_probabilities),)
-                        )
-                    )
+                    
                 if ofile is not None:
                     print(f'done with {os.path.basename(ofile)}')
                 else:
                     print(f'\nDone with image of shape {data.shape}:')
-            ret = [i.get()[0] for i in r]
 
         if isinstance(data_iterator, MultiThreadedAugmenter):
             data_iterator._finish()
@@ -417,7 +404,6 @@ class nnUNetPredictor(object):
         compute_gaussian.cache_clear()
         # clear device cache
         empty_cache(self.device)
-        return ret
 
     def predict_single_npy_array(self, input_image: np.ndarray, image_properties: dict,
                                  segmentation_previous_stage: np.ndarray = None,
@@ -446,8 +432,8 @@ class nnUNetPredictor(object):
 
         if self.verbose:
             print('predicting')
-        predicted_logits = self.predict_logits_from_preprocessed_data(dct['data']).cpu()
-
+        original_feature, embedding_feature = self.predict_logits_from_preprocessed_data(dct['data']).cpu()
+        #output_file_truncated가 파일이름
         if self.verbose:
             print('resampling to original shape')
         if output_file_truncated is not None:
@@ -476,7 +462,7 @@ class nnUNetPredictor(object):
         """
         n_threads = torch.get_num_threads()
         torch.set_num_threads(default_num_processes if default_num_processes < n_threads else n_threads)
-        prediction = None
+        original_feature = embedding_feature = None
 
         for params in self.list_of_parameters:
 
@@ -489,17 +475,23 @@ class nnUNetPredictor(object):
             # why not leave prediction on device if perform_everything_on_device? Because this may cause the
             # second iteration to crash due to OOM. Grabbing that with try except cause way more bloated code than
             # this actually saves computation time
-            if prediction is None:
-                prediction = self.predict_sliding_window_return_logits(data).to('cpu')
+            if original_feature is None:
+                original_feature, embedding_feature = self.predict_sliding_window_return_logits(data)
+                original_feature = original_feature.to('cpu')
+                embedding_feature = embedding_feature.to('cpu')
             else:
-                prediction += self.predict_sliding_window_return_logits(data).to('cpu')
-
+                original_feature_new, embedding_feature_new = self.predict_sliding_window_return_logits(data)
+                original_feature_new = original_feature_new.to('cpu')
+                embedding_feature_new = embedding_feature_new.to('cpu')
+                original_feature += original_feature_new
+                embedding_feature += embedding_feature_new
         if len(self.list_of_parameters) > 1:
-            prediction /= len(self.list_of_parameters)
+            original_feature /= len(self.list_of_parameters)
+            embedding_feature /= len(self.list_of_parameters)
 
         if self.verbose: print('Prediction done')
         torch.set_num_threads(n_threads)
-        return prediction
+        return original_feature, embedding_feature
 
     def _internal_get_sliding_window_slicers(self, image_size: Tuple[int, ...]):
         slicers = []
@@ -537,7 +529,8 @@ class nnUNetPredictor(object):
 
     def _internal_maybe_mirror_and_predict(self, x: torch.Tensor) -> torch.Tensor:
         mirror_axes = self.allowed_mirroring_axes if self.use_mirroring else None
-        prediction = self.network(x)
+        x = x[:, 0:1, :, :, :]
+        original_feature, embedding_feature = self.network(x)
 
         if mirror_axes is not None:
             # check for invalid numbers in mirror_axes
@@ -549,9 +542,13 @@ class nnUNetPredictor(object):
                 c for i in range(len(mirror_axes)) for c in itertools.combinations(mirror_axes, i + 1)
             ]
             for axes in axes_combinations:
-                prediction += torch.flip(self.network(torch.flip(x, axes)), axes)
-            prediction /= (len(axes_combinations) + 1)
-        return prediction
+                temp_original_feature, temp_embedding_feature = self.network(torch.flip(x, axes))
+                original_feature += torch.flip(temp_original_feature, axes)
+                embedding_feature += torch.flip(temp_embedding_feature, axes)
+                
+            original_feature /= (len(axes_combinations) + 1)
+            embedding_feature /= (len(axes_combinations) + 1)
+        return original_feature, embedding_feature
 
     def _internal_predict_sliding_window_return_logits(self,
                                                        data: torch.Tensor,
@@ -572,7 +569,11 @@ class nnUNetPredictor(object):
             # preallocate arrays
             if self.verbose:
                 print(f'preallocating results arrays on device {results_device}')
-            predicted_logits = torch.zeros((self.label_manager.num_segmentation_heads, *data.shape[1:]),
+            
+            original_features = torch.zeros((self.configuration_manager.network_arch_init_kwargs['features_per_stage'][0], *data.shape[1:]),
+                                           dtype=torch.half,
+                                           device=results_device)
+            embedding_features = torch.zeros((self.configuration_manager.network_arch_init_kwargs['features_per_stage'][0] // 4, *data.shape[1:]),
                                            dtype=torch.half,
                                            device=results_device)
             n_predictions = torch.zeros(data.shape[1:], dtype=torch.half, device=results_device)
@@ -590,25 +591,36 @@ class nnUNetPredictor(object):
                 workon = data[sl][None]
                 workon = workon.to(self.device)
 
-                prediction = self._internal_maybe_mirror_and_predict(workon)[0].to(results_device)
-
+                #prediction = self._internal_maybe_mirror_and_predict(workon)[0].to(results_device)
+                temp_original_feature, temp_embedding_feature = self._internal_maybe_mirror_and_predict(workon)
+                original_feature = temp_original_feature[0].to(results_device)
+                embedding_feature = temp_embedding_feature[0].to(results_device)
+                
+                #if self.use_gaussian:
+                #    prediction *= gaussian
+                #predicted_logits[sl] += prediction
+                #n_predictions[sl[1:]] += gaussian
+                
                 if self.use_gaussian:
-                    prediction *= gaussian
-                predicted_logits[sl] += prediction
+                    original_feature *= gaussian
+                    embedding_feature *= gaussian
+                original_features[sl] += original_feature    
+                embedding_features[sl] += embedding_feature
                 n_predictions[sl[1:]] += gaussian
 
-            predicted_logits /= n_predictions
+            original_features /= n_predictions
+            embedding_features /= n_predictions
             # check for infs
-            if torch.any(torch.isinf(predicted_logits)):
+            if torch.any(torch.isinf(original_features)) or torch.any(torch.isinf(embedding_features)):
                 raise RuntimeError('Encountered inf in predicted array. Aborting... If this problem persists, '
                                    'reduce value_scaling_factor in compute_gaussian or increase the dtype of '
                                    'predicted_logits to fp32')
         except Exception as e:
-            del predicted_logits, n_predictions, prediction, gaussian, workon
+            del original_features, embedding_features, n_predictions, prediction, gaussian, workon
             empty_cache(self.device)
             empty_cache(results_device)
             raise e
-        return predicted_logits
+        return original_features, embedding_features
 
     def predict_sliding_window_return_logits(self, input_image: torch.Tensor) \
             -> Union[np.ndarray, torch.Tensor]:
@@ -643,21 +655,22 @@ class nnUNetPredictor(object):
                 if self.perform_everything_on_device and self.device != 'cpu':
                     # we need to try except here because we can run OOM in which case we need to fall back to CPU as a results device
                     try:
-                        predicted_logits = self._internal_predict_sliding_window_return_logits(data, slicers,
+                        original_features, embedding_features = self._internal_predict_sliding_window_return_logits(data, slicers,
                                                                                                self.perform_everything_on_device)
                     except RuntimeError:
                         print(
                             'Prediction on device was unsuccessful, probably due to a lack of memory. Moving results arrays to CPU')
                         empty_cache(self.device)
-                        predicted_logits = self._internal_predict_sliding_window_return_logits(data, slicers, False)
+                        original_features, embedding_features = self._internal_predict_sliding_window_return_logits(data, slicers, False)
                 else:
-                    predicted_logits = self._internal_predict_sliding_window_return_logits(data, slicers,
+                    original_features, embedding_features = self._internal_predict_sliding_window_return_logits(data, slicers,
                                                                                            self.perform_everything_on_device)
 
                 empty_cache(self.device)
                 # revert padding
-                predicted_logits = predicted_logits[(slice(None), *slicer_revert_padding[1:])]
-        return predicted_logits
+                original_features = original_features[(slice(None), *slicer_revert_padding[1:])]
+                embedding_features = embedding_features[(slice(None), *slicer_revert_padding[1:])]
+        return original_features, embedding_features
 
 
 def predict_entry_point_modelfolder():
@@ -850,31 +863,7 @@ def predict_entry_point():
         device = torch.device('cuda')
     else:
         device = torch.device('mps')
-    
-    #########tSNE로 임시로 바꾼 요소
-    #tSNEPredictor
-    predictor = FeaturePredictor(tile_step_size=args.step_size,
-                                use_gaussian=True,
-                                use_mirroring=not args.disable_tta,
-                                perform_everything_on_device=True,
-                                device=device,
-                                verbose=args.verbose,
-                                verbose_preprocessing=args.verbose,
-                                allow_tqdm=not args.disable_progress_bar)
-    predictor.initialize_from_trained_model_folder(
-        model_folder,
-        args.f,
-        checkpoint_name=args.chk
-    )
-    predictor.predict_from_files(args.i, args.o, save_probabilities=args.save_probabilities,
-                                 overwrite=not args.continue_prediction,
-                                 num_processes_preprocessing=args.npp,
-                                 num_processes_segmentation_export=args.nps,
-                                 folder_with_segs_from_prev_stage=args.prev_stage_predictions,
-                                 num_parts=args.num_parts,
-                                 part_id=args.part_id)
-    ###################
-    exit()
+
     predictor = nnUNetPredictor(tile_step_size=args.step_size,
                                 use_gaussian=True,
                                 use_mirroring=not args.disable_tta,
@@ -895,7 +884,6 @@ def predict_entry_point():
                                  folder_with_segs_from_prev_stage=args.prev_stage_predictions,
                                  num_parts=args.num_parts,
                                  part_id=args.part_id)
-    
     # r = predict_from_raw_data(args.i,
     #                           args.o,
     #                           model_folder,

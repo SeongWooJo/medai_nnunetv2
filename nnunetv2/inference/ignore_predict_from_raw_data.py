@@ -35,7 +35,7 @@ from nnunetv2.utilities.utils import create_lists_from_splitted_dataset_folder
 from nnunetv2.inference.tSNE_predict_from_raw_data import tSNEPredictor
 from nnunetv2.inference.feature_predict_from_raw_data import FeaturePredictor
 
-class nnUNetPredictor(object):
+class IgnorePredictor(object):
     def __init__(self,
                  tile_step_size: float = 0.5,
                  use_gaussian: bool = True,
@@ -70,7 +70,7 @@ class nnUNetPredictor(object):
         This is used when making predictions with a trained model
         """
         if use_folds is None:
-            use_folds = nnUNetPredictor.auto_detect_available_folds(model_training_output_dir, checkpoint_name)
+            use_folds = IgnorePredictor.auto_detect_available_folds(model_training_output_dir, checkpoint_name)
 
         dataset_json = load_json(join(model_training_output_dir, 'dataset.json'))
         plans = load_json(join(model_training_output_dir, 'plans.json'))
@@ -572,7 +572,7 @@ class nnUNetPredictor(object):
             # preallocate arrays
             if self.verbose:
                 print(f'preallocating results arrays on device {results_device}')
-            predicted_logits = torch.zeros((self.label_manager.num_segmentation_heads, *data.shape[1:]),
+            predicted_logits = torch.zeros((self.label_manager.num_segmentation_heads - 1, *data.shape[1:]),
                                            dtype=torch.half,
                                            device=results_device)
             n_predictions = torch.zeros(data.shape[1:], dtype=torch.half, device=results_device)
@@ -598,6 +598,7 @@ class nnUNetPredictor(object):
                 n_predictions[sl[1:]] += gaussian
 
             predicted_logits /= n_predictions
+                        
             # check for infs
             if torch.any(torch.isinf(predicted_logits)):
                 raise RuntimeError('Encountered inf in predicted array. Aborting... If this problem persists, '
@@ -657,6 +658,7 @@ class nnUNetPredictor(object):
                 empty_cache(self.device)
                 # revert padding
                 predicted_logits = predicted_logits[(slice(None), *slicer_revert_padding[1:])]
+                
         return predicted_logits
 
 

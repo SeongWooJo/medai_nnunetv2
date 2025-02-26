@@ -33,9 +33,8 @@ from nnunetv2.utilities.label_handling.label_handling import determine_num_input
 from nnunetv2.utilities.plans_handling.plans_handler import PlansManager, ConfigurationManager
 from nnunetv2.utilities.utils import create_lists_from_splitted_dataset_folder
 from nnunetv2.inference.tSNE_predict_from_raw_data import tSNEPredictor
-from nnunetv2.inference.feature_predict_from_raw_data import FeaturePredictor
 
-class nnUNetPredictor(object):
+class FeaturePredictor(object):
     def __init__(self,
                  tile_step_size: float = 0.5,
                  use_gaussian: bool = True,
@@ -70,7 +69,7 @@ class nnUNetPredictor(object):
         This is used when making predictions with a trained model
         """
         if use_folds is None:
-            use_folds = nnUNetPredictor.auto_detect_available_folds(model_training_output_dir, checkpoint_name)
+            use_folds = FeaturePredictor.auto_detect_available_folds(model_training_output_dir, checkpoint_name)
 
         dataset_json = load_json(join(model_training_output_dir, 'dataset.json'))
         plans = load_json(join(model_training_output_dir, 'plans.json'))
@@ -101,10 +100,10 @@ class nnUNetPredictor(object):
             raise RuntimeError(f'Unable to locate trainer class {trainer_name} in nnunetv2.training.nnUNetTrainer. '
                                f'Please place it there (in any .py file)!')
         network = trainer_class.build_network_architecture(
-            configuration_manager.network_arch_class_name,
+            "dynamic_network_architectures.architectures.predicted_featured_unet.Predicted_Featured_UNet",
             configuration_manager.network_arch_init_kwargs,
             configuration_manager.network_arch_init_kwargs_req_import,
-            num_input_channels,
+            1,
             plans_manager.get_label_manager(dataset_json).num_segmentation_heads,
             enable_deep_supervision=False
         )
@@ -376,39 +375,17 @@ class nnUNetPredictor(object):
                 prediction = self.predict_logits_from_preprocessed_data(data).cpu()
 
                 if ofile is not None:
-                    # this needs to go into background processes
-                    # export_prediction_from_logits(prediction, properties, self.configuration_manager, self.plans_manager,
-                    #                               self.dataset_json, ofile, save_probabilities)
-                    print('sending off prediction to background worker for resampling and export')
-                    r.append(
-                        export_pool.starmap_async(
-                            export_prediction_from_logits,
-                            ((prediction, properties, self.configuration_manager, self.plans_manager,
-                              self.dataset_json, ofile, save_probabilities),)
-                        )
-                    )
+                    original_array = prediction.numpy()
+                    np.savez(ofile + '.npz', origin=prediction)
+                    #make_graph_from_feature(original_feature, embedding_feature, ofile)
                 else:
-                    # convert_predicted_logits_to_segmentation_with_correct_shape(
-                    #             prediction, self.plans_manager,
-                    #              self.configuration_manager, self.label_manager,
-                    #              properties,
-                    #              save_probabilities)
-
+                    assert("이거 나오면 한강가면 됨")
                     print('sending off prediction to background worker for resampling')
-                    r.append(
-                        export_pool.starmap_async(
-                            convert_predicted_logits_to_segmentation_with_correct_shape, (
-                                (prediction, self.plans_manager,
-                                 self.configuration_manager, self.label_manager,
-                                 properties,
-                                 save_probabilities),)
-                        )
-                    )
+                    
                 if ofile is not None:
                     print(f'done with {os.path.basename(ofile)}')
                 else:
                     print(f'\nDone with image of shape {data.shape}:')
-            ret = [i.get()[0] for i in r]
 
         if isinstance(data_iterator, MultiThreadedAugmenter):
             data_iterator._finish()
@@ -417,7 +394,6 @@ class nnUNetPredictor(object):
         compute_gaussian.cache_clear()
         # clear device cache
         empty_cache(self.device)
-        return ret
 
     def predict_single_npy_array(self, input_image: np.ndarray, image_properties: dict,
                                  segmentation_previous_stage: np.ndarray = None,
@@ -572,7 +548,7 @@ class nnUNetPredictor(object):
             # preallocate arrays
             if self.verbose:
                 print(f'preallocating results arrays on device {results_device}')
-            predicted_logits = torch.zeros((self.label_manager.num_segmentation_heads, *data.shape[1:]),
+            predicted_logits = torch.zeros((self.configuration_manager.network_arch_init_kwargs['features_per_stage'][0], *data.shape[1:]),
                                            dtype=torch.half,
                                            device=results_device)
             n_predictions = torch.zeros(data.shape[1:], dtype=torch.half, device=results_device)
@@ -852,8 +828,8 @@ def predict_entry_point():
         device = torch.device('mps')
     
     #########tSNE로 임시로 바꾼 요소
-    #tSNEPredictor
-    predictor = FeaturePredictor(tile_step_size=args.step_size,
+
+    predictor = tSNEPredictor(tile_step_size=args.step_size,
                                 use_gaussian=True,
                                 use_mirroring=not args.disable_tta,
                                 perform_everything_on_device=True,

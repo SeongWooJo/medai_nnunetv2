@@ -32,10 +32,9 @@ from nnunetv2.utilities.json_export import recursive_fix_for_json_export
 from nnunetv2.utilities.label_handling.label_handling import determine_num_input_channels
 from nnunetv2.utilities.plans_handling.plans_handler import PlansManager, ConfigurationManager
 from nnunetv2.utilities.utils import create_lists_from_splitted_dataset_folder
-from nnunetv2.inference.tSNE_predict_from_raw_data import tSNEPredictor
-from nnunetv2.inference.feature_predict_from_raw_data import FeaturePredictor
 
-class nnUNetPredictor(object):
+
+class Feature3Predictor(object):
     def __init__(self,
                  tile_step_size: float = 0.5,
                  use_gaussian: bool = True,
@@ -537,7 +536,8 @@ class nnUNetPredictor(object):
 
     def _internal_maybe_mirror_and_predict(self, x: torch.Tensor) -> torch.Tensor:
         mirror_axes = self.allowed_mirroring_axes if self.use_mirroring else None
-        prediction = self.network(x)
+        x = x[:, 0:1, :, :, :]
+        prediction, _, _ = self.network(x)
 
         if mirror_axes is not None:
             # check for invalid numbers in mirror_axes
@@ -549,7 +549,8 @@ class nnUNetPredictor(object):
                 c for i in range(len(mirror_axes)) for c in itertools.combinations(mirror_axes, i + 1)
             ]
             for axes in axes_combinations:
-                prediction += torch.flip(self.network(torch.flip(x, axes)), axes)
+                temp_result, _, _ = self.network(torch.flip(x, axes))
+                prediction += torch.flip(temp_result, axes)
             prediction /= (len(axes_combinations) + 1)
         return prediction
 
@@ -850,31 +851,7 @@ def predict_entry_point():
         device = torch.device('cuda')
     else:
         device = torch.device('mps')
-    
-    #########tSNE로 임시로 바꾼 요소
-    #tSNEPredictor
-    predictor = FeaturePredictor(tile_step_size=args.step_size,
-                                use_gaussian=True,
-                                use_mirroring=not args.disable_tta,
-                                perform_everything_on_device=True,
-                                device=device,
-                                verbose=args.verbose,
-                                verbose_preprocessing=args.verbose,
-                                allow_tqdm=not args.disable_progress_bar)
-    predictor.initialize_from_trained_model_folder(
-        model_folder,
-        args.f,
-        checkpoint_name=args.chk
-    )
-    predictor.predict_from_files(args.i, args.o, save_probabilities=args.save_probabilities,
-                                 overwrite=not args.continue_prediction,
-                                 num_processes_preprocessing=args.npp,
-                                 num_processes_segmentation_export=args.nps,
-                                 folder_with_segs_from_prev_stage=args.prev_stage_predictions,
-                                 num_parts=args.num_parts,
-                                 part_id=args.part_id)
-    ###################
-    exit()
+
     predictor = nnUNetPredictor(tile_step_size=args.step_size,
                                 use_gaussian=True,
                                 use_mirroring=not args.disable_tta,
@@ -895,7 +872,6 @@ def predict_entry_point():
                                  folder_with_segs_from_prev_stage=args.prev_stage_predictions,
                                  num_parts=args.num_parts,
                                  part_id=args.part_id)
-    
     # r = predict_from_raw_data(args.i,
     #                           args.o,
     #                           model_folder,

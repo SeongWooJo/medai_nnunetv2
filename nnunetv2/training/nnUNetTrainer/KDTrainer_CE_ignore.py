@@ -46,7 +46,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from nnunetv2.configuration import ANISO_THRESHOLD, default_num_processes
 from nnunetv2.evaluation.evaluate_predictions import compute_metrics_on_folder
 from nnunetv2.inference.export_prediction import export_prediction_from_logits, resample_and_save
-from nnunetv2.inference.case_predict_from_raw_data import CasePredictor
+from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
 from nnunetv2.inference.sliding_window_prediction import compute_gaussian
 from nnunetv2.paths import nnUNet_preprocessed, nnUNet_results
 from nnunetv2.training.data_augmentation.compute_initial_patch_size import get_patch_size
@@ -81,7 +81,7 @@ from threadpoolctl import threadpool_limits
 # -> use KLDiv Loss
 # not working...
 
-class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
+class KDTrainer_CE_ignore(nnUNetTrainer):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict, unpack_dataset: bool = True,
                  device: torch.device = torch.device('cuda')):
         # From https://grugbrain.dev/. Worth a read ya big brains ;-)
@@ -158,14 +158,13 @@ class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
         ### Some hyperparameters for you to fiddle with
         self.initial_lr = 1e-2
         self.weight_decay = 3e-5
-        self.oversample_foreground_percent = 0.33
+        self.oversample_foreground_percent = 1.00
         self.num_iterations_per_epoch = 250
         self.num_val_iterations_per_epoch = 50
         self.num_epochs = 1000
         self.current_epoch = 0
         self.enable_deep_supervision = True
-        self.teacher_enable_deep_supervision = True
-        
+
         ### Dealing with labels/regions
         self.label_manager = self.plans_manager.get_label_manager(dataset_json)
         # labels can either be a list of int (regular training) or a list of tuples of int (region-based training)
@@ -173,8 +172,6 @@ class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
 
         self.num_input_channels = None  # -> self.initialize()
         self.network = None  # -> self.build_network_architecture()
-        self.cect_embedding = None
-        self.ncct_embedding = None
         self.teacher_network = None
         self.optimizer = self.lr_scheduler = None  # -> self.initialize
         # self.grad_scaler = GradScaler() if self.device.type == 'cuda' else None
@@ -242,36 +239,10 @@ class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
                 self.enable_deep_supervision
             ).to(self.device)
 
-            input_volume_size = self.configuration_manager.patch_size
-            #input_nums = 1
-            #for elem in input_volume_size:
-            #    input_nums *= elem 
-            hightes_feature_nums = self.configuration_manager.network_arch_init_kwargs['features_per_stage'][0]
-            #linear_input_size = hightes_feature_nums
-            
-            self.cect_embedding = nn.Sequential(
-                nn.Conv3d(hightes_feature_nums, hightes_feature_nums // 2, 1, 1, 0),  # 첫 번째 Linear Layer (입력: 512 → 출력: 256)
-                nn.ReLU(),            # 비선형 활성화 함수
-                nn.LayerNorm(normalized_shape=(hightes_feature_nums // 2, *input_volume_size)),    # Layer Normalization 적용
-                nn.Conv3d(hightes_feature_nums // 2, hightes_feature_nums // 4, 1, 1, 0),  # 두 번째 Linear Layer (출력: 128)
-                nn.LayerNorm(normalized_shape=(hightes_feature_nums // 4, *input_volume_size)),    # 최종 Layer Normalization
-                nn.ReLU()
-            ).to(self.device)
-            self.ncct_embedding = nn.Sequential(
-                nn.Conv3d(hightes_feature_nums, hightes_feature_nums // 2, 1, 1, 0),  # 첫 번째 Linear Layer (입력: 512 → 출력: 256)
-                nn.ReLU(),            # 비선형 활성화 함수
-                nn.LayerNorm(normalized_shape=(hightes_feature_nums // 2, *input_volume_size)),    # Layer Normalization 적용
-                nn.Conv3d(hightes_feature_nums // 2, hightes_feature_nums // 4, 1, 1, 0),  # 두 번째 Linear Layer (출력: 128)
-                nn.LayerNorm(normalized_shape=(hightes_feature_nums // 4, *input_volume_size)),    # 최종 Layer Normalization
-                nn.ReLU()
-            ).to(self.device)
-            
             # compile network for free speedup
             if self._do_i_compile():
                 self.print_to_log_file('Using torch.compile...')
                 self.network = torch.compile(self.network)
-                self.cect_embedding  = torch.compile(self.cect_embedding)
-                self.ncct_embedding  = torch.compile(self.ncct_embedding)
                 self.teacher_network = torch.compile(self.teacher_network)
 
             self.optimizer, self.lr_scheduler = self.configure_optimizers()
@@ -281,11 +252,6 @@ class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
                 self.network = DDP(self.network, device_ids=[self.local_rank])
                 self.teacher_network = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.teacher_network)
                 self.teacher_network = DDP(self.teacher_network, device_ids=[self.local_rank])
-                self.cect_embedding = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.cect_embedding)
-                self.cect_embedding = DDP(self.cect_embedding, device_ids=[self.local_rank])
-                self.ncct_embedding = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.ncct_embedding)
-                self.ncct_embedding = DDP(self.ncct_embedding, device_ids=[self.local_rank])
-                
 
 
             self.loss = self._build_loss()
@@ -386,7 +352,7 @@ class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
                                    num_output_channels: int,
                                    enable_deep_supervision: bool = True) -> nn.Module:
         
-        pretrain_network = torch.load("/data/nnUNet_Dataset/nnUNet_results/Dataset503_Kits19KD_CECT/nnUNetTrainer__nnUNetPlans__3d_fullres/fold_0/checkpoint_final.pth", weights_only=False)['network_weights']
+        pretrain_network = torch.load("/data/seongwoo/nnunetFrame/nnunet_results/Dataset508_Kits19KD_CECT/ignore_only__nnUNetPlans__3d_fullres/fold_0/checkpoint_final.pth")['network_weights']
 
         network = get_network_from_plans(
             architecture_class_name,
@@ -511,7 +477,7 @@ class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
         # if self._do_i_compile():
         #     loss.dc = torch.compile(loss.dc)
 
-        if self.enable_deep_supervision and self.teacher_enable_deep_supervision:
+        if self.enable_deep_supervision:
             deep_supervision_scales = self._get_deep_supervision_scales()
             weights = np.array([1 / (2 ** i) for i in range(len(deep_supervision_scales))])
             if self.is_ddp and not self._do_i_compile():
@@ -607,7 +573,7 @@ class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
             self.print_to_log_file('These are the global plan.json settings:\n', dct, '\n', add_timestamp=False)
 
     def configure_optimizers(self):
-        optimizer = torch.optim.SGD(list(self.network.parameters()) + list(self.cect_embedding.parameters()) + list(self.ncct_embedding.parameters()), self.initial_lr, weight_decay=self.weight_decay,
+        optimizer = torch.optim.SGD(self.network.parameters(), self.initial_lr, weight_decay=self.weight_decay,
                                     momentum=0.99, nesterov=True)
         lr_scheduler = PolyLRScheduler(optimizer, self.initial_lr, self.num_epochs)
         return optimizer, lr_scheduler
@@ -1090,7 +1056,6 @@ class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
         data_0 = data_0.to(self.device, non_blocking=True)
         data_1 = data_1.to(self.device, non_blocking=True)
         
-        batch_size = data_0.size(0)
         if isinstance(target, list):
             target = [i.to(self.device, non_blocking=True) for i in target]
         else:
@@ -1101,140 +1066,20 @@ class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
         with autocast(self.device.type, enabled=True) if 0 else dummy_context():
             # Forward pass with the teacher model - do not save gradients here as we do not change the teacher's weights
             with torch.no_grad():
-                teacher_output, teacher_feature = self.teacher_network(data_1)           # CECT
+                teacher_output = self.teacher_network(data_1)           # CECT
             
             # Forward pass with the student model
-            student_output, student_feature = self.network(data_0)                       # NCCT
+            student_output = self.network(data_0)                       # NCCT
             
-
-            kidney_mask = torch.isin(target[0], torch.tensor([1],device=self.device))
-            tumor_mask = torch.isin(target[0], torch.tensor([2],device=self.device))
- 
             student_l = self.loss(student_output, target)               # DC_CE_loss(student network output, gt label)
+            teacher_l = self.t_loss(student_output, teacher_output)     # KLDiv loss
             
-            teacher_kidney_feature = teacher_feature * kidney_mask
-            student_kidney_feature = student_feature * kidney_mask
-            teacher_tumor_feature = teacher_feature * tumor_mask
-            student_tumor_feature = student_feature * tumor_mask
-            
-            random_sample_nums = 20000
-            kidney_pairs_nums = 10
-            pair_mode = True
-            ## tumor, kidney mask를 (batch, depth, height, width)로 압축시키고 그곳에 0이 아닌 positions만 가져옴
-            ## tensor(list of list)
-            kidney_positions = kidney_mask.squeeze(dim=1).nonzero(as_tuple=False)
-            tumor_positions = tumor_mask.squeeze(dim=1).nonzero(as_tuple=False)
-            
-            contrast_condition = False
-            if not len(list(set(torch.unique(kidney_positions[:, 0]).tolist()) & set(torch.unique(tumor_positions[:, 0]).tolist()))) == 0:
-                contrast_condition = True
-            
-            if contrast_condition:
-                #print("test")
-                # batch별 인덱스 추출
-                student_kidney_feature = student_feature * kidney_mask
-                embedding_student_kidney_vector = self.ncct_embedding(student_kidney_feature)
-                
-                teacher_tumor_feature = teacher_feature * tumor_mask
-                embedding_teacher_tumor_vector = self.cect_embedding(teacher_tumor_feature)
-                
-                student_tumor_feature = student_feature * tumor_mask
-                embedding_student_tumor_vector = self.ncct_embedding(student_tumor_feature)
-                
-                unique_batches, inverse_indices = torch.unique(kidney_positions[:, 0], return_inverse=True)
-                batch_counts = torch.bincount(inverse_indices)
-
-                kidney_splits = torch.split(kidney_positions, batch_counts.tolist())
-                batch_kidney_positions = {key: torch.empty((0,)) for key in range(batch_size)}  # 모든 key를 기본적으로 빈 리스트로 초기화
-
-                batch_kidney_positions.update({unique_batches[i].item(): kidney_splits[i] for i in range(len(unique_batches))})
-                
-                unique_batches, inverse_indices = torch.unique(tumor_positions[:, 0], return_inverse=True)
-                batch_counts = torch.bincount(inverse_indices)
-                tumor_splits = torch.split(tumor_positions, batch_counts.tolist())
-                batch_tumor_positions = {key: torch.empty((0,)) for key in range(batch_size)}  # 모든 key를 기본적으로 빈 리스트로 초기화
-
-                batch_tumor_positions.update({unique_batches[i].item(): tumor_splits[i] for i in range(len(unique_batches))})
-
-                # 각 배치별 벡터 저장 리스트
-                batch_student_kidney_vectors = [torch.empty((0,), device=self.device) for _ in range(batch_size)]
-                batch_teacher_tumor_vectors = [torch.empty((0,), device=self.device) for _ in range(batch_size)]
-                batch_student_tumor_vectors = [torch.empty((0,), device=self.device) for _ in range(batch_size)]
-                batch_expanded_student_tumor_vectors = [torch.empty((0,), device=self.device) for _ in range(batch_size)]
-
-                #batch_tumor_distances = [torch.empty((0,), device=self.device) for _ in range(batch_size)]
-                #batch_kidney_distances = [torch.empty((0,), device=self.device) for _ in range(batch_size)]
-
-                for batch_num in range(0,batch_size):
-                    if len(batch_tumor_positions[batch_num]) == 0 or len(batch_kidney_positions[batch_num]) == 0:
-                        continue
-                    tumor_idx = torch.randint(0, len(batch_tumor_positions[batch_num]), (random_sample_nums,), device=self.device)
-                    expanded_tumor_idx = tumor_idx.unsqueeze(1).expand(-1, kidney_pairs_nums).reshape(-1)
-                    #tumor_idx2 = torch.randint(0, len(batch_tumor_positions[batch_num]), (random_sample_nums * kidney_pairs_nums,), device=self.device)
-                    
-                    expanded_tumor_pos = batch_tumor_positions[batch_num][expanded_tumor_idx]
-                    sample_tumor_pos2 = batch_tumor_positions[batch_num][tumor_idx]
-                    #sample_tumor_pos2 = batch_tumor_positions[batch_num][tumor_idx2]
-                    tumor_depth_idx, tumor_height_idx, tumor_width_idx = sample_tumor_pos2[:, 1], sample_tumor_pos2[:, 2], sample_tumor_pos2[:, 3]
-                        
-                    if pair_mode:
-                        teacher_tumor_vector = embedding_teacher_tumor_vector[batch_num, :, tumor_depth_idx, tumor_height_idx, tumor_width_idx].T
-                        student_tumor_vector = embedding_student_tumor_vector[batch_num, :, tumor_depth_idx, tumor_height_idx, tumor_width_idx].T
-                        batch_teacher_tumor_vectors[batch_num] = teacher_tumor_vector
-                        batch_student_tumor_vectors[batch_num] = student_tumor_vector
-                    else: ## 모든 tumor를 평균과 비교하는 경우
-                        teacher_tumor_vector = embedding_teacher_tumor_vector[batch_num].mean(dim=(1,2,3)).unsqueeze(1).expand(-1, random_sample_nums).T
-                        student_tumor_vector = embedding_student_tumor_vector[batch_num, :, tumor_depth_idx, tumor_height_idx, tumor_width_idx].T
-                        batch_teacher_tumor_vectors[batch_num] = teacher_tumor_vector
-                        batch_student_tumor_vectors[batch_num] = student_tumor_vector
-                    
-                    kidney_idx = torch.randint(0, len(batch_kidney_positions[batch_num]), (random_sample_nums * kidney_pairs_nums,), device=self.device)
-                    sample_kidney_pos = batch_kidney_positions[batch_num][kidney_idx]
-                    
-                    kidney_depth_idx, kidney_height_idx, kidney_width_idx = sample_kidney_pos[:, 1], sample_kidney_pos[:, 2], sample_kidney_pos[:, 3]
-                    e_tumor_depth_idx, e_tumor_height_idx, e_tumor_width_idx = expanded_tumor_pos[:, 1], expanded_tumor_pos[:, 2], expanded_tumor_pos[:, 3]
-                    
-                    student_kidney_vector = embedding_student_kidney_vector[batch_num, :, kidney_depth_idx, kidney_height_idx, kidney_width_idx].T  # (c,)
-                    expanded_student_tumor_vector = embedding_student_tumor_vector[batch_num, :, e_tumor_depth_idx, e_tumor_height_idx, e_tumor_width_idx].T
-
-                    #kidney_distances = torch.sqrt(
-                    #    (e_tumor_depth_idx - kidney_depth_idx) ** 2 +
-                    #    (e_tumor_height_idx - kidney_height_idx) ** 2 +
-                    #    (e_tumor_width_idx - kidney_width_idx) ** 2
-                    #)
-                    #kidney_min, kidney_max = torch.aminmax(kidney_distances, dim=0)
-                    #kidney_distances_norm = None
-                    #if kidney_min == kidney_max:
-                    #    kidney_distances_norm = torch.ones(random_sample_nums, device=self.device) * (1/random_sample_nums)
-                    #else:
-                    #    kidney_distances_norm = 1 - (kidney_distances - kidney_min) / (kidney_max - kidney_min)
-                    #batch_kidney_distances[batch_num] = kidney_distances_norm
-                    
-                    batch_expanded_student_tumor_vectors[batch_num] = expanded_student_tumor_vector
-                    batch_student_kidney_vectors[batch_num] = student_kidney_vector
-                # 리스트 -> 텐서 변환 (각 batch별로 쌓기)
-                teacher_kidney_tensor = torch.cat([v for v in batch_student_kidney_vectors if not len(v) == 0], dim=0)
-                expanded_student_tumor_tensor = torch.cat([v for v in batch_expanded_student_tumor_vectors if not len(v) == 0], dim=0)
-                teacher_tumor_tensor = torch.cat([v for v in batch_teacher_tumor_vectors if not len(v) == 0], dim=0)
-                student_tumor_tensor = torch.cat([v for v in batch_student_tumor_vectors if not len(v) == 0], dim=0)
-
-                #tumor_distance_tensor = torch.cat([v for v in batch_tumor_distances if not len(v) == 0], dim=0)
-                #kidney_distance_tensor = torch.cat([v for v in batch_kidney_distances if not len(v) == 0], dim=0)
-
-                tumor_similarity = torch.nn.functional.cosine_similarity(teacher_tumor_tensor, student_tumor_tensor, dim=-1)
-                kidney_similarity = torch.nn.functional.cosine_similarity(teacher_kidney_tensor, expanded_student_tumor_tensor, dim=-1)
-                exp_t = torch.exp(tumor_similarity)
-                exp_k = torch.exp(kidney_similarity)
-
-                sim_loss = -1 /(random_sample_nums) * torch.log(exp_t.sum() / exp_k.sum())
-            else:
-                sim_loss = 0
             # Weight needs to be adjusted
-            student_weight = 1
-            sim_weight = 1
-            l = student_weight * student_l + sim_weight * sim_loss
+            student_weight = 0.75
+            teacher_weight = 0.25
+            l = student_weight * student_l + teacher_weight * teacher_l
             
-        if self.grad_scaler is not None and 0:
+        if self.grad_scaler is not None:
             self.grad_scaler.scale(l).backward()
             self.grad_scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
@@ -1283,7 +1128,7 @@ class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
         # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
         # So autocast will only be active if we have a cuda device.
         with autocast(self.device.type, enabled=True) if 0 else dummy_context():
-            output, _ = self.network(data)
+            output = self.network(data)
             del data
             l = self.loss(output, target)
 
@@ -1474,7 +1319,7 @@ class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
                                    "forward pass (where compile is triggered) already has deep supervision disabled. "
                                    "This is exactly what we need in perform_actual_validation")
 
-        predictor = CasePredictor(tile_step_size=0.5, use_gaussian=True, use_mirroring=True,
+        predictor = nnUNetPredictor(tile_step_size=0.5, use_gaussian=True, use_mirroring=True,
                                     perform_everything_on_device=True, device=self.device, verbose=False,
                                     verbose_preprocessing=False, allow_tqdm=False)
         predictor.manual_initialization(self.network, self.plans_manager, self.configuration_manager, None,

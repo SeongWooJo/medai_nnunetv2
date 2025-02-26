@@ -46,7 +46,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from nnunetv2.configuration import ANISO_THRESHOLD, default_num_processes
 from nnunetv2.evaluation.evaluate_predictions import compute_metrics_on_folder
 from nnunetv2.inference.export_prediction import export_prediction_from_logits, resample_and_save
-from nnunetv2.inference.case_predict_from_raw_data import CasePredictor
+from nnunetv2.inference.feature3_predict_from_raw_data import Feature3Predictor
 from nnunetv2.inference.sliding_window_prediction import compute_gaussian
 from nnunetv2.paths import nnUNet_preprocessed, nnUNet_results
 from nnunetv2.training.data_augmentation.compute_initial_patch_size import get_patch_size
@@ -54,8 +54,9 @@ from nnunetv2.training.dataloading.data_loader_2d import nnUNetDataLoader2D
 from nnunetv2.training.dataloading.data_loader_3d import nnUNetDataLoader3D
 from nnunetv2.training.dataloading.nnunet_dataset import nnUNetDataset
 from nnunetv2.training.dataloading.utils import get_case_identifiers, unpack_dataset
-from nnunetv2.training.logging.nnunet_logger import nnUNetLogger
+from nnunetv2.training.logging.kd_contrast_logger import KDContrastLogger
 from nnunetv2.training.loss.compound_losses import DC_and_CE_loss, DC_and_BCE_loss
+from nnunetv2.training.loss.contrast_loss import ContrastLoss
 from nnunetv2.training.loss.deep_supervision import DeepSupervisionWrapper
 from nnunetv2.training.loss.dice import get_tp_fp_fn_tn, MemoryEfficientSoftDiceLoss
 from nnunetv2.training.lr_scheduler.polylr import PolyLRScheduler
@@ -68,11 +69,13 @@ from nnunetv2.utilities.helpers import empty_cache, dummy_context
 from nnunetv2.utilities.label_handling.label_handling import convert_labelmap_to_one_hot, determine_num_input_channels
 from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
 from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
+from dynamic_network_architectures.architectures.embedding_layers import Embedding_Layers
 
 from nnunetv2.training.loss.compound_losses import KD_CE_loss
 import os
 from datetime import datetime
 from threadpoolctl import threadpool_limits
+from collections import deque
 
 # from torch.utils.tensorboard import SummaryWriter
 
@@ -81,7 +84,7 @@ from threadpoolctl import threadpool_limits
 # -> use KLDiv Loss
 # not working...
 
-class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
+class featured_embedding_simple_contrast_Trainer3(nnUNetTrainer):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict, unpack_dataset: bool = True,
                  device: torch.device = torch.device('cuda')):
         # From https://grugbrain.dev/. Worth a read ya big brains ;-)
@@ -173,14 +176,18 @@ class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
 
         self.num_input_channels = None  # -> self.initialize()
         self.network = None  # -> self.build_network_architecture()
-        self.cect_embedding = None
-        self.ncct_embedding = None
+        
+        self.kidney_queue = None
+        self.tumor_queue = None
+        self.background_queue = None
+        self.queue_length = 10
+
         self.teacher_network = None
         self.optimizer = self.lr_scheduler = None  # -> self.initialize
         # self.grad_scaler = GradScaler() if self.device.type == 'cuda' else None
         self.grad_scaler = None
         self.loss = None  # -> self.initialize
-
+        self.c_loss = None
         ### Simple logging. Don't take that away from me!
         # initialize log file. This is just our log for the print statements etc. Not to be confused with lightning
         # logging
@@ -189,7 +196,7 @@ class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
         self.log_file = join(self.output_folder, "training_log_%d_%d_%d_%02.0d_%02.0d_%02.0d.txt" %
                              (timestamp.year, timestamp.month, timestamp.day, timestamp.hour, timestamp.minute,
                               timestamp.second))
-        self.logger = nnUNetLogger()
+        self.logger = KDContrastLogger()
 
         ### placeholders
         self.dataloader_train = self.dataloader_val = None  # see on_train_start
@@ -218,19 +225,25 @@ class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
                                "Nature methods, 18(2), 203-211.\n"
                                "#######################################################################\n",
                                also_print_to_console=True, add_timestamp=False)
-
+    
     def initialize(self):
         if not self.was_initialized:
             self.num_input_channels = determine_num_input_channels(self.plans_manager, self.configuration_manager,
                                                                    self.dataset_json)
             
+            embedding_kwargs = {'input_size' : self.configuration_manager.patch_size,
+                                'features_nums' : self.configuration_manager.network_arch_init_kwargs['features_per_stage'],
+                                'strides' : self.configuration_manager.network_arch_init_kwargs['strides'],
+                                'n_stages' : self.configuration_manager.network_arch_init_kwargs['n_stages']}
+
             self.teacher_network = self.build_teacher_network_architecture(
                 self.configuration_manager.network_arch_class_name,
                 self.configuration_manager.network_arch_init_kwargs,
                 self.configuration_manager.network_arch_init_kwargs_req_import,
                 1,
                 self.label_manager.num_segmentation_heads,
-                self.enable_deep_supervision
+                self.enable_deep_supervision,
+                embedding_kwargs
             ).to(self.device)
 
             self.network = self.build_network_architecture(
@@ -239,39 +252,25 @@ class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
                 self.configuration_manager.network_arch_init_kwargs_req_import,
                 1,
                 self.label_manager.num_segmentation_heads,
-                self.enable_deep_supervision
+                self.enable_deep_supervision,
+                embedding_kwargs
             ).to(self.device)
 
-            input_volume_size = self.configuration_manager.patch_size
-            #input_nums = 1
-            #for elem in input_volume_size:
-            #    input_nums *= elem 
-            hightes_feature_nums = self.configuration_manager.network_arch_init_kwargs['features_per_stage'][0]
-            #linear_input_size = hightes_feature_nums
+
+            input_size = self.configuration_manager.patch_size
+            feature_nums = self.configuration_manager.network_arch_init_kwargs['features_per_stage']
+            strides = self.configuration_manager.network_arch_init_kwargs['strides']
+            n_stages = self.configuration_manager.network_arch_init_kwargs['n_stages']
             
-            self.cect_embedding = nn.Sequential(
-                nn.Conv3d(hightes_feature_nums, hightes_feature_nums // 2, 1, 1, 0),  # 첫 번째 Linear Layer (입력: 512 → 출력: 256)
-                nn.ReLU(),            # 비선형 활성화 함수
-                nn.LayerNorm(normalized_shape=(hightes_feature_nums // 2, *input_volume_size)),    # Layer Normalization 적용
-                nn.Conv3d(hightes_feature_nums // 2, hightes_feature_nums // 4, 1, 1, 0),  # 두 번째 Linear Layer (출력: 128)
-                nn.LayerNorm(normalized_shape=(hightes_feature_nums // 4, *input_volume_size)),    # 최종 Layer Normalization
-                nn.ReLU()
-            ).to(self.device)
-            self.ncct_embedding = nn.Sequential(
-                nn.Conv3d(hightes_feature_nums, hightes_feature_nums // 2, 1, 1, 0),  # 첫 번째 Linear Layer (입력: 512 → 출력: 256)
-                nn.ReLU(),            # 비선형 활성화 함수
-                nn.LayerNorm(normalized_shape=(hightes_feature_nums // 2, *input_volume_size)),    # Layer Normalization 적용
-                nn.Conv3d(hightes_feature_nums // 2, hightes_feature_nums // 4, 1, 1, 0),  # 두 번째 Linear Layer (출력: 128)
-                nn.LayerNorm(normalized_shape=(hightes_feature_nums // 4, *input_volume_size)),    # 최종 Layer Normalization
-                nn.ReLU()
-            ).to(self.device)
+            self.cect_embedding = Embedding_Layers(input_size, feature_nums, strides, n_stages)
+            self.cect_embedding = self.cect_embedding.to(self.device)
+            self.ncct_embedding = Embedding_Layers(input_size, feature_nums, strides, n_stages)
+            self.ncct_embedding = self.ncct_embedding.to(self.device)
             
             # compile network for free speedup
             if self._do_i_compile():
                 self.print_to_log_file('Using torch.compile...')
                 self.network = torch.compile(self.network)
-                self.cect_embedding  = torch.compile(self.cect_embedding)
-                self.ncct_embedding  = torch.compile(self.ncct_embedding)
                 self.teacher_network = torch.compile(self.teacher_network)
 
             self.optimizer, self.lr_scheduler = self.configure_optimizers()
@@ -281,14 +280,9 @@ class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
                 self.network = DDP(self.network, device_ids=[self.local_rank])
                 self.teacher_network = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.teacher_network)
                 self.teacher_network = DDP(self.teacher_network, device_ids=[self.local_rank])
-                self.cect_embedding = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.cect_embedding)
-                self.cect_embedding = DDP(self.cect_embedding, device_ids=[self.local_rank])
-                self.ncct_embedding = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.ncct_embedding)
-                self.ncct_embedding = DDP(self.ncct_embedding, device_ids=[self.local_rank])
-                
-
 
             self.loss = self._build_loss()
+            self.c_loss = self._build_c_loss()
             self.t_loss = self._build_t_loss()
             # torch 2.2.2 crashes upon compiling CE loss
             # if self._do_i_compile():
@@ -367,9 +361,9 @@ class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
                                    arch_init_kwargs_req_import: Union[List[str], Tuple[str, ...]],
                                    num_input_channels: int,
                                    num_output_channels: int,
-                                   enable_deep_supervision: bool = True) -> nn.Module:
-
-        return get_network_from_plans(
+                                   enable_deep_supervision: bool = True,
+                                   embedding_kwargs: dict = None) -> nn.Module:
+        network = get_network_from_plans(
             architecture_class_name,
             arch_init_kwargs,
             arch_init_kwargs_req_import,
@@ -377,6 +371,12 @@ class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
             num_output_channels,
             allow_init=True,
             deep_supervision=enable_deep_supervision)
+        
+        network.make_embedding_layer(**embedding_kwargs)
+
+        if hasattr(network, 'initialize'):
+            network.apply(network.initialize)
+        return network
     
     @staticmethod
     def build_teacher_network_architecture(architecture_class_name: str,
@@ -384,7 +384,8 @@ class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
                                    arch_init_kwargs_req_import: Union[List[str], Tuple[str, ...]],
                                    num_input_channels: int,
                                    num_output_channels: int,
-                                   enable_deep_supervision: bool = True) -> nn.Module:
+                                   enable_deep_supervision: bool = True,
+                                   embedding_kwargs: dict = None) -> nn.Module:
         
         pretrain_network = torch.load("/data/nnUNet_Dataset/nnUNet_results/Dataset503_Kits19KD_CECT/nnUNetTrainer__nnUNetPlans__3d_fullres/fold_0/checkpoint_final.pth", weights_only=False)['network_weights']
 
@@ -396,6 +397,8 @@ class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
             num_output_channels,
             allow_init=True,
             deep_supervision=enable_deep_supervision)
+        
+        network.make_embedding_layer(**embedding_kwargs)
         
         if hasattr(network, 'initialize'):
             network.apply(network.initialize)
@@ -504,6 +507,28 @@ class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
 
         return loss
     
+    def _build_c_loss(self):
+        loss = ContrastLoss()
+        # we give each output a weight which decreases exponentially (division by 2) as the resolution decreases
+        # this gives higher resolution outputs more weight in the loss
+
+        if self.enable_deep_supervision:
+            deep_supervision_scales = self._get_deep_supervision_scales()
+            weights = np.array([1 / (2 ** i) for i in range(len(deep_supervision_scales))])
+            if self.is_ddp and not self._do_i_compile():
+                # very strange and stupid interaction. DDP crashes and complains about unused parameters due to
+                # weights[-1] = 0. Interestingly this crash doesn't happen with torch.compile enabled. Strange stuff.
+                # Anywho, the simple fix is to set a very low weight to this.
+                weights[-1] = 1e-6
+            else:
+                weights[-1] = 0
+
+            # we don't use the lowest 2 outputs. Normalize weights so that they sum to 1
+            weights = weights / weights.sum()
+            # now wrap the loss
+            loss = DeepSupervisionWrapper(loss, weights)
+        return loss
+
     def _build_t_loss(self):
 
         loss = KD_CE_loss(reduction = 'mean', temperature = 2)
@@ -607,7 +632,7 @@ class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
             self.print_to_log_file('These are the global plan.json settings:\n', dct, '\n', add_timestamp=False)
 
     def configure_optimizers(self):
-        optimizer = torch.optim.SGD(list(self.network.parameters()) + list(self.cect_embedding.parameters()) + list(self.ncct_embedding.parameters()), self.initial_lr, weight_decay=self.weight_decay,
+        optimizer = torch.optim.SGD(list(self.network.parameters())+ list(self.teacher_network.embedding_layer.parameters())+ list(self.teacher_network.embedding_layer2.parameters()), self.initial_lr, weight_decay=self.weight_decay,
                                     momentum=0.99, nesterov=True)
         lr_scheduler = PolyLRScheduler(optimizer, self.initial_lr, self.num_epochs)
         return optimizer, lr_scheduler
@@ -1072,6 +1097,8 @@ class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
     def on_train_epoch_start(self):
         self.teacher_network.eval()
         self.network.train()
+        self.cect_embedding.train()
+        self.ncct_embedding.train()
         self.lr_scheduler.step(self.current_epoch)
         self.print_to_log_file('')
         self.print_to_log_file(f'Epoch {self.current_epoch}')
@@ -1079,6 +1106,12 @@ class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
             f"Current learning rate: {np.round(self.optimizer.param_groups[0]['lr'], decimals=5)}")
         # lrs are the same for all workers so we don't need to gather them in case of DDP training
         self.logger.log('lrs', self.optimizer.param_groups[0]['lr'], self.current_epoch)
+
+        deep_supervision_scales = self._get_deep_supervision_scales()
+        
+        self.kidney_queue = [deque(maxlen=self.queue_length) for _ in range(len(deep_supervision_scales))]
+        self.background_queue  = [deque(maxlen=self.queue_length) for _ in range(len(deep_supervision_scales))]
+        
 
     def train_step(self, batch: dict) -> dict:
         data = batch['data']
@@ -1089,8 +1122,6 @@ class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
         
         data_0 = data_0.to(self.device, non_blocking=True)
         data_1 = data_1.to(self.device, non_blocking=True)
-        
-        batch_size = data_0.size(0)
         if isinstance(target, list):
             target = [i.to(self.device, non_blocking=True) for i in target]
         else:
@@ -1100,139 +1131,35 @@ class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
 
         with autocast(self.device.type, enabled=True) if 0 else dummy_context():
             # Forward pass with the teacher model - do not save gradients here as we do not change the teacher's weights
-            with torch.no_grad():
-                teacher_output, teacher_feature = self.teacher_network(data_1)           # CECT
+            #with torch.no_grad():
+            teacher_output, teacher_features1, teacher_features2 = self.teacher_network(data_1)           # CECT
             
             # Forward pass with the student model
-            student_output, student_feature = self.network(data_0)                       # NCCT
-            
-
-            kidney_mask = torch.isin(target[0], torch.tensor([1],device=self.device))
-            tumor_mask = torch.isin(target[0], torch.tensor([2],device=self.device))
- 
+            student_output, student_features1, student_features2 = self.network(data_0)                       # NCCT
             student_l = self.loss(student_output, target)               # DC_CE_loss(student network output, gt label)
-            
-            teacher_kidney_feature = teacher_feature * kidney_mask
-            student_kidney_feature = student_feature * kidney_mask
-            teacher_tumor_feature = teacher_feature * tumor_mask
-            student_tumor_feature = student_feature * tumor_mask
-            
-            random_sample_nums = 20000
-            kidney_pairs_nums = 10
-            pair_mode = True
-            ## tumor, kidney mask를 (batch, depth, height, width)로 압축시키고 그곳에 0이 아닌 positions만 가져옴
-            ## tensor(list of list)
-            kidney_positions = kidney_mask.squeeze(dim=1).nonzero(as_tuple=False)
-            tumor_positions = tumor_mask.squeeze(dim=1).nonzero(as_tuple=False)
-            
-            contrast_condition = False
-            if not len(list(set(torch.unique(kidney_positions[:, 0]).tolist()) & set(torch.unique(tumor_positions[:, 0]).tolist()))) == 0:
-                contrast_condition = True
-            
-            if contrast_condition:
-                #print("test")
-                # batch별 인덱스 추출
-                student_kidney_feature = student_feature * kidney_mask
-                embedding_student_kidney_vector = self.ncct_embedding(student_kidney_feature)
-                
-                teacher_tumor_feature = teacher_feature * tumor_mask
-                embedding_teacher_tumor_vector = self.cect_embedding(teacher_tumor_feature)
-                
-                student_tumor_feature = student_feature * tumor_mask
-                embedding_student_tumor_vector = self.ncct_embedding(student_tumor_feature)
-                
-                unique_batches, inverse_indices = torch.unique(kidney_positions[:, 0], return_inverse=True)
-                batch_counts = torch.bincount(inverse_indices)
+            sim_loss = self.c_loss(student_output, student_features2, target, self.kidney_queue, self.background_queue)
+            #print(sim_loss)
 
-                kidney_splits = torch.split(kidney_positions, batch_counts.tolist())
-                batch_kidney_positions = {key: torch.empty((0,)) for key in range(batch_size)}  # 모든 key를 기본적으로 빈 리스트로 초기화
+        weights = None
+        if self.enable_deep_supervision:
+            deep_supervision_scales = self._get_deep_supervision_scales()
+            weights = [1 / (2 ** i) for i in range(len(deep_supervision_scales))]
+        
+        ### Knowledge Distillation
+        kd_loss_list = []
+        for weight, teacher_feature, student_feature in zip(weights, teacher_features1, student_features1):
+            #teacher_norm_feature = torch.nn.functional.normalize(teacher_origin_feature, p=2, dim=1)
+            #student_norm_feature = torch.nn.functional.normalize(student_origin_feature, p=2, dim=1)
 
-                batch_kidney_positions.update({unique_batches[i].item(): kidney_splits[i] for i in range(len(unique_batches))})
-                
-                unique_batches, inverse_indices = torch.unique(tumor_positions[:, 0], return_inverse=True)
-                batch_counts = torch.bincount(inverse_indices)
-                tumor_splits = torch.split(tumor_positions, batch_counts.tolist())
-                batch_tumor_positions = {key: torch.empty((0,)) for key in range(batch_size)}  # 모든 key를 기본적으로 빈 리스트로 초기화
+            mse_loss = torch.nn.functional.mse_loss(teacher_feature, student_feature)
+            kd_loss_list.append(mse_loss * weight)
 
-                batch_tumor_positions.update({unique_batches[i].item(): tumor_splits[i] for i in range(len(unique_batches))})
-
-                # 각 배치별 벡터 저장 리스트
-                batch_student_kidney_vectors = [torch.empty((0,), device=self.device) for _ in range(batch_size)]
-                batch_teacher_tumor_vectors = [torch.empty((0,), device=self.device) for _ in range(batch_size)]
-                batch_student_tumor_vectors = [torch.empty((0,), device=self.device) for _ in range(batch_size)]
-                batch_expanded_student_tumor_vectors = [torch.empty((0,), device=self.device) for _ in range(batch_size)]
-
-                #batch_tumor_distances = [torch.empty((0,), device=self.device) for _ in range(batch_size)]
-                #batch_kidney_distances = [torch.empty((0,), device=self.device) for _ in range(batch_size)]
-
-                for batch_num in range(0,batch_size):
-                    if len(batch_tumor_positions[batch_num]) == 0 or len(batch_kidney_positions[batch_num]) == 0:
-                        continue
-                    tumor_idx = torch.randint(0, len(batch_tumor_positions[batch_num]), (random_sample_nums,), device=self.device)
-                    expanded_tumor_idx = tumor_idx.unsqueeze(1).expand(-1, kidney_pairs_nums).reshape(-1)
-                    #tumor_idx2 = torch.randint(0, len(batch_tumor_positions[batch_num]), (random_sample_nums * kidney_pairs_nums,), device=self.device)
-                    
-                    expanded_tumor_pos = batch_tumor_positions[batch_num][expanded_tumor_idx]
-                    sample_tumor_pos2 = batch_tumor_positions[batch_num][tumor_idx]
-                    #sample_tumor_pos2 = batch_tumor_positions[batch_num][tumor_idx2]
-                    tumor_depth_idx, tumor_height_idx, tumor_width_idx = sample_tumor_pos2[:, 1], sample_tumor_pos2[:, 2], sample_tumor_pos2[:, 3]
-                        
-                    if pair_mode:
-                        teacher_tumor_vector = embedding_teacher_tumor_vector[batch_num, :, tumor_depth_idx, tumor_height_idx, tumor_width_idx].T
-                        student_tumor_vector = embedding_student_tumor_vector[batch_num, :, tumor_depth_idx, tumor_height_idx, tumor_width_idx].T
-                        batch_teacher_tumor_vectors[batch_num] = teacher_tumor_vector
-                        batch_student_tumor_vectors[batch_num] = student_tumor_vector
-                    else: ## 모든 tumor를 평균과 비교하는 경우
-                        teacher_tumor_vector = embedding_teacher_tumor_vector[batch_num].mean(dim=(1,2,3)).unsqueeze(1).expand(-1, random_sample_nums).T
-                        student_tumor_vector = embedding_student_tumor_vector[batch_num, :, tumor_depth_idx, tumor_height_idx, tumor_width_idx].T
-                        batch_teacher_tumor_vectors[batch_num] = teacher_tumor_vector
-                        batch_student_tumor_vectors[batch_num] = student_tumor_vector
-                    
-                    kidney_idx = torch.randint(0, len(batch_kidney_positions[batch_num]), (random_sample_nums * kidney_pairs_nums,), device=self.device)
-                    sample_kidney_pos = batch_kidney_positions[batch_num][kidney_idx]
-                    
-                    kidney_depth_idx, kidney_height_idx, kidney_width_idx = sample_kidney_pos[:, 1], sample_kidney_pos[:, 2], sample_kidney_pos[:, 3]
-                    e_tumor_depth_idx, e_tumor_height_idx, e_tumor_width_idx = expanded_tumor_pos[:, 1], expanded_tumor_pos[:, 2], expanded_tumor_pos[:, 3]
-                    
-                    student_kidney_vector = embedding_student_kidney_vector[batch_num, :, kidney_depth_idx, kidney_height_idx, kidney_width_idx].T  # (c,)
-                    expanded_student_tumor_vector = embedding_student_tumor_vector[batch_num, :, e_tumor_depth_idx, e_tumor_height_idx, e_tumor_width_idx].T
-
-                    #kidney_distances = torch.sqrt(
-                    #    (e_tumor_depth_idx - kidney_depth_idx) ** 2 +
-                    #    (e_tumor_height_idx - kidney_height_idx) ** 2 +
-                    #    (e_tumor_width_idx - kidney_width_idx) ** 2
-                    #)
-                    #kidney_min, kidney_max = torch.aminmax(kidney_distances, dim=0)
-                    #kidney_distances_norm = None
-                    #if kidney_min == kidney_max:
-                    #    kidney_distances_norm = torch.ones(random_sample_nums, device=self.device) * (1/random_sample_nums)
-                    #else:
-                    #    kidney_distances_norm = 1 - (kidney_distances - kidney_min) / (kidney_max - kidney_min)
-                    #batch_kidney_distances[batch_num] = kidney_distances_norm
-                    
-                    batch_expanded_student_tumor_vectors[batch_num] = expanded_student_tumor_vector
-                    batch_student_kidney_vectors[batch_num] = student_kidney_vector
-                # 리스트 -> 텐서 변환 (각 batch별로 쌓기)
-                teacher_kidney_tensor = torch.cat([v for v in batch_student_kidney_vectors if not len(v) == 0], dim=0)
-                expanded_student_tumor_tensor = torch.cat([v for v in batch_expanded_student_tumor_vectors if not len(v) == 0], dim=0)
-                teacher_tumor_tensor = torch.cat([v for v in batch_teacher_tumor_vectors if not len(v) == 0], dim=0)
-                student_tumor_tensor = torch.cat([v for v in batch_student_tumor_vectors if not len(v) == 0], dim=0)
-
-                #tumor_distance_tensor = torch.cat([v for v in batch_tumor_distances if not len(v) == 0], dim=0)
-                #kidney_distance_tensor = torch.cat([v for v in batch_kidney_distances if not len(v) == 0], dim=0)
-
-                tumor_similarity = torch.nn.functional.cosine_similarity(teacher_tumor_tensor, student_tumor_tensor, dim=-1)
-                kidney_similarity = torch.nn.functional.cosine_similarity(teacher_kidney_tensor, expanded_student_tumor_tensor, dim=-1)
-                exp_t = torch.exp(tumor_similarity)
-                exp_k = torch.exp(kidney_similarity)
-
-                sim_loss = -1 /(random_sample_nums) * torch.log(exp_t.sum() / exp_k.sum())
-            else:
-                sim_loss = 0
-            # Weight needs to be adjusted
-            student_weight = 1
-            sim_weight = 1
-            l = student_weight * student_l + sim_weight * sim_loss
+        kd_loss = torch.sum(torch.stack(kd_loss_list))  
+        # Weight needs to be adjusted
+        student_weight = 1
+        sim_weight = 1 - (self.current_epoch / self.num_epochs)
+        kd_weight = 0.33
+        l = student_weight * student_l + sim_weight * sim_loss + kd_weight * kd_loss
             
         if self.grad_scaler is not None and 0:
             self.grad_scaler.scale(l).backward()
@@ -1244,7 +1171,9 @@ class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
             l.backward()
             torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
             self.optimizer.step()
-        return {'loss': l.detach().cpu().numpy()}
+
+        #self.optimizer.zero_grad(set_to_none=True)  # for back propagation?
+        return {'loss': student_l.detach().cpu().numpy(), 'kd_loss' : kd_loss.detach().cpu().numpy(), 'c_loss' : sim_loss.detach().cpu().numpy()}
 
     def on_train_epoch_end(self, train_outputs: List[dict]):
         outputs = collate_outputs(train_outputs)
@@ -1255,9 +1184,18 @@ class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
             loss_here = np.vstack(losses_tr).mean()
         else:
             loss_here = np.mean(outputs['loss'])
-
+            kd_loss_here = np.mean(outputs['kd_loss'])
+            c_loss_here = np.mean(outputs['c_loss'])
+            
+        torch.cuda.empty_cache()
         self.logger.log('train_losses', loss_here, self.current_epoch)
-
+        self.logger.log('train_kd_losses', kd_loss_here, self.current_epoch)
+        self.logger.log('train_c_losses', c_loss_here, self.current_epoch)
+        for queue in self.kidney_queue:
+            queue.clear()
+        for queue in self.background_queue:
+            queue.clear()
+        
     def on_validation_epoch_start(self):
         self.network.eval()
 
@@ -1266,11 +1204,11 @@ class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
         target = batch['target']
 
         data_0 = data[:, 0:1, :, :, :]  # B x 1 x D x W x H, NCCT, for student training -> this goes in 
-        # data_1 = data[:, 1:2, :, :, :]  # B x 1 x D x W x H, CECT, for teacher validation
+        data_1 = data[:, 1:2, :, :, :]  # B x 1 x D x W x H, CECT, for teacher validation
         # data_2 = data[:, 2:3, :, :, :]  # B x 1 x D x W x H, ignore_label
 
-        data = data_0.to(self.device, non_blocking=True)
-        # data_1 = data_1.to(self.device, non_blocking=True)
+        data_0 = data_0.to(self.device, non_blocking=True)
+        data_1 = data_1.to(self.device, non_blocking=True)
         # data_2 = data_2.to(self.device, non_blocking=True)
 
         if isinstance(target, list):
@@ -1283,10 +1221,28 @@ class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
         # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
         # So autocast will only be active if we have a cuda device.
         with autocast(self.device.type, enabled=True) if 0 else dummy_context():
-            output, _ = self.network(data)
+            _, teacher_features1, teacher_features2 = self.teacher_network(data_1)
+            student_output, student_features1, student_features2 = self.network(data_0)
+            output = student_output
             del data
             l = self.loss(output, target)
+            sim_loss = self.c_loss(student_output, student_features2, target, self.kidney_queue, self.background_queue)
+            
+        weights = None
+        if self.enable_deep_supervision:
+            deep_supervision_scales = self._get_deep_supervision_scales()
+            weights = [1 / (2 ** i) for i in range(len(deep_supervision_scales))]
+        
+        ### Knowledge Distillation
+        kd_loss_list = []
+        for weight, teacher_origin_feature, student_origin_feature in zip(weights, teacher_features1, student_features1):
+            teacher_norm_feature = torch.nn.functional.normalize(teacher_origin_feature, p=2, dim=1)
+            student_norm_feature = torch.nn.functional.normalize(student_origin_feature, p=2, dim=1)
 
+            mse_loss = torch.nn.functional.mse_loss(teacher_norm_feature, student_norm_feature)
+            kd_loss_list.append(mse_loss * weight)
+
+        kd_loss = torch.sum(torch.stack(kd_loss_list))  
         # we only need the output with the highest output resolution (if DS enabled)
         if self.enable_deep_supervision:
             output = output[0]
@@ -1333,9 +1289,13 @@ class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
             fp_hard = fp_hard[1:]
             fn_hard = fn_hard[1:]
 
-        return {'loss': l.detach().cpu().numpy(), 'tp_hard': tp_hard, 'fp_hard': fp_hard, 'fn_hard': fn_hard}
+        return {'loss': l.detach().cpu().numpy(), 'tp_hard': tp_hard, 'fp_hard': fp_hard, 'fn_hard': fn_hard, 'kd_loss' : kd_loss.detach().cpu().numpy(), 'c_loss' : sim_loss.detach().cpu().numpy()}
 
     def on_validation_epoch_end(self, val_outputs: List[dict]):
+        for queue in self.kidney_queue:
+            queue.clear()
+        for queue in self.background_queue:
+            queue.clear()
         outputs_collated = collate_outputs(val_outputs)
         tp = np.sum(outputs_collated['tp_hard'], 0)
         fp = np.sum(outputs_collated['fp_hard'], 0)
@@ -1361,13 +1321,17 @@ class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
             loss_here = np.vstack(losses_val).mean()
         else:
             loss_here = np.mean(outputs_collated['loss'])
-
+            kd_loss_here = np.mean(outputs_collated['kd_loss'])
+            c_loss_here = np.mean(outputs_collated['c_loss'])
+            
         global_dc_per_class = [i for i in [2 * i / (2 * i + j + k) for i, j, k in zip(tp, fp, fn)]]
         mean_fg_dice = np.nanmean(global_dc_per_class)
         self.logger.log('mean_fg_dice', mean_fg_dice, self.current_epoch)
         self.logger.log('dice_per_class_or_region', global_dc_per_class, self.current_epoch)
         self.logger.log('val_losses', loss_here, self.current_epoch)
-
+        self.logger.log('val_kd_losses', kd_loss_here, self.current_epoch)
+        self.logger.log('val_c_losses', c_loss_here, self.current_epoch)
+        
     def on_epoch_start(self):
         self.logger.log('epoch_start_timestamps', time(), self.current_epoch)
 
@@ -1376,6 +1340,11 @@ class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
 
         self.print_to_log_file('train_loss', np.round(self.logger.my_fantastic_logging['train_losses'][-1], decimals=4))
         self.print_to_log_file('val_loss', np.round(self.logger.my_fantastic_logging['val_losses'][-1], decimals=4))
+        self.print_to_log_file('train_c_loss', np.round(self.logger.my_fantastic_logging['train_c_losses'][-1], decimals=4))
+        self.print_to_log_file('val_c_loss', np.round(self.logger.my_fantastic_logging['val_c_losses'][-1], decimals=4))
+        self.print_to_log_file('train_kd_loss', np.round(self.logger.my_fantastic_logging['train_kd_losses'][-1], decimals=4))
+        self.print_to_log_file('val_kd_loss', np.round(self.logger.my_fantastic_logging['val_kd_losses'][-1], decimals=4))
+        
         self.print_to_log_file('Pseudo dice', [np.round(i, decimals=4) for i in
                                                self.logger.my_fantastic_logging['dice_per_class_or_region'][-1]])
         self.print_to_log_file(
@@ -1474,7 +1443,7 @@ class pixelwise_cos_similiar_Trainer2(nnUNetTrainer):
                                    "forward pass (where compile is triggered) already has deep supervision disabled. "
                                    "This is exactly what we need in perform_actual_validation")
 
-        predictor = CasePredictor(tile_step_size=0.5, use_gaussian=True, use_mirroring=True,
+        predictor = Feature3Predictor(tile_step_size=0.5, use_gaussian=True, use_mirroring=True,
                                     perform_everything_on_device=True, device=self.device, verbose=False,
                                     verbose_preprocessing=False, allow_tqdm=False)
         predictor.manual_initialization(self.network, self.plans_manager, self.configuration_manager, None,
