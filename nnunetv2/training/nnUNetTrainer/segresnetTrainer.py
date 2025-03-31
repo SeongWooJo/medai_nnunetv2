@@ -40,7 +40,7 @@ from torch import autocast, nn
 from torch import distributed as dist
 from torch._dynamo import OptimizedModule
 from torch.cuda import device_count
-from torch.amp import GradScaler
+from torch.cuda.amp import GradScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from nnunetv2.configuration import ANISO_THRESHOLD, default_num_processes
@@ -68,8 +68,13 @@ from nnunetv2.utilities.helpers import empty_cache, dummy_context
 from nnunetv2.utilities.label_handling.label_handling import convert_labelmap_to_one_hot, determine_num_input_channels
 from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
 
+# from dynamic_network_architectures.architectures.segresnet import SegResNet
+from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
 
-class nnUNetTrainer(object):
+from monai.networks.nets import SegResNet
+from nnunetv2.inference.segresnet_predict_from_raw_data import segresnetPredictor
+
+class segresnetTrainer(nnUNetTrainer):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict, unpack_dataset: bool = True,
                  device: torch.device = torch.device('cuda')):
         # From https://grugbrain.dev/. Worth a read ya big brains ;-)
@@ -151,7 +156,7 @@ class nnUNetTrainer(object):
         self.num_val_iterations_per_epoch = 50
         self.num_epochs = 1000
         self.current_epoch = 0
-        self.enable_deep_supervision = True
+        self.enable_deep_supervision = False
 
         ### Dealing with labels/regions
         self.label_manager = self.plans_manager.get_label_manager(dataset_json)
@@ -162,6 +167,7 @@ class nnUNetTrainer(object):
         self.network = None  # -> self.build_network_architecture()
         self.optimizer = self.lr_scheduler = None  # -> self.initialize
         self.grad_scaler = GradScaler() if self.device.type == 'cuda' else None
+        self.grad_scaler = None
         self.loss = None  # -> self.initialize
 
         ### Simple logging. Don't take that away from me!
@@ -207,14 +213,28 @@ class nnUNetTrainer(object):
             self.num_input_channels = determine_num_input_channels(self.plans_manager, self.configuration_manager,
                                                                    self.dataset_json)
 
-            self.network = self.build_network_architecture(
-                self.configuration_manager.network_arch_class_name,
-                self.configuration_manager.network_arch_init_kwargs,
-                self.configuration_manager.network_arch_init_kwargs_req_import,
-                self.num_input_channels,
-                self.label_manager.num_segmentation_heads,
-                self.enable_deep_supervision
+            # self.network = self.build_network_architecture(
+            #     self.configuration_manager.network_arch_class_name,
+            #     self.configuration_manager.network_arch_init_kwargs,
+            #     self.configuration_manager.network_arch_init_kwargs_req_import,
+            #     self.num_input_channels,
+            #     self.label_manager.num_segmentation_heads,
+            #     self.enable_deep_supervision
+            # ).to(self.device)
+
+            max_epochs = 300
+            val_interval = 1
+            VAL_AMP = True
+
+            self.network = SegResNet(
+                blocks_down=[1, 2, 2, 4],
+                blocks_up=[1, 1, 1],
+                init_filters=16,
+                in_channels=self.num_input_channels,
+                out_channels=self.label_manager.num_segmentation_heads,
+                dropout_prob=0.2,
             ).to(self.device)
+
             # compile network for free speedup
             if self._do_i_compile():
                 self.print_to_log_file('Using torch.compile...')
@@ -503,9 +523,11 @@ class nnUNetTrainer(object):
             self.print_to_log_file('These are the global plan.json settings:\n', dct, '\n', add_timestamp=False)
 
     def configure_optimizers(self):
-        optimizer = torch.optim.SGD(self.network.parameters(), self.initial_lr, weight_decay=self.weight_decay,
-                                    momentum=0.99, nesterov=True)
-        lr_scheduler = PolyLRScheduler(optimizer, self.initial_lr, self.num_epochs)
+        # optimizer = torch.optim.SGD(self.network.parameters(), self.initial_lr, weight_decay=self.weight_decay,
+        #                             momentum=0.99, nesterov=True)
+        # lr_scheduler = PolyLRScheduler(optimizer, self.initial_lr, self.num_epochs)
+        optimizer = torch.optim.Adam(self.network.parameters(), 1e-4, weight_decay=1e-5)
+        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.num_epochs)
         return optimizer, lr_scheduler
 
     def plot_network_architecture(self):
@@ -895,7 +917,7 @@ class nnUNetTrainer(object):
         if isinstance(mod, OptimizedModule):
             mod = mod._orig_mod
 
-        mod.decoder.deep_supervision = enabled
+        # mod.decoder.deep_supervision = enabled
 
     def on_train_start(self):
         # dataloaders must be instantiated here (instead of __init__) because they need access to the training data
@@ -990,7 +1012,8 @@ class nnUNetTrainer(object):
         # If the device_type is 'cpu' then it's slow as heck and needs to be disabled.
         # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
         # So autocast will only be active if we have a cuda device.
-        with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
+        # with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
+        with autocast(self.device.type, enabled=True) if 0 else dummy_context():
             output = self.network(data)
             # del data
             l = self.loss(output, target)
@@ -1036,7 +1059,7 @@ class nnUNetTrainer(object):
         # If the device_type is 'cpu' then it's slow as heck and needs to be disabled.
         # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
         # So autocast will only be active if we have a cuda device.
-        with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
+        with autocast(self.device.type, enabled=True) if 0 else dummy_context():
             output = self.network(data)
             del data
             l = self.loss(output, target)
@@ -1139,6 +1162,7 @@ class nnUNetTrainer(object):
         current_epoch = self.current_epoch
         if (current_epoch + 1) % self.save_every == 0 and current_epoch != (self.num_epochs - 1):
             self.save_checkpoint(join(self.output_folder, 'checkpoint_latest.pth'))
+            self.save_checkpoint(join(self.output_folder, f'checkpoint_{current_epoch}.pth'))
 
         # handle 'best' checkpointing. ema_fg_dice is computed by the logger and can be accessed like this
         if self._best_ema is None or self.logger.my_fantastic_logging['ema_fg_dice'][-1] > self._best_ema:
@@ -1228,7 +1252,7 @@ class nnUNetTrainer(object):
                                    "forward pass (where compile is triggered) already has deep supervision disabled. "
                                    "This is exactly what we need in perform_actual_validation")
 
-        predictor = nnUNetPredictor(tile_step_size=0.5, use_gaussian=True, use_mirroring=True,
+        predictor = segresnetPredictor(tile_step_size=0.5, use_gaussian=True, use_mirroring=True,
                                     perform_everything_on_device=True, device=self.device, verbose=False,
                                     verbose_preprocessing=False, allow_tqdm=False)
         predictor.manual_initialization(self.network, self.plans_manager, self.configuration_manager, None,

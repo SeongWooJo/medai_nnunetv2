@@ -46,7 +46,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from nnunetv2.configuration import ANISO_THRESHOLD, default_num_processes
 from nnunetv2.evaluation.evaluate_predictions import compute_metrics_on_folder
 from nnunetv2.inference.export_prediction import export_prediction_from_logits, resample_and_save
-from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
+from nnunetv2.inference.option_predict_from_raw_data import OptionPredictor
+from nnunetv2.inference.ignore_predict_from_raw_data import IgnorePredictor
 from nnunetv2.inference.sliding_window_prediction import compute_gaussian
 from nnunetv2.paths import nnUNet_preprocessed, nnUNet_results
 from nnunetv2.training.data_augmentation.compute_initial_patch_size import get_patch_size
@@ -54,8 +55,10 @@ from nnunetv2.training.dataloading.data_loader_2d import nnUNetDataLoader2D
 from nnunetv2.training.dataloading.data_loader_3d import nnUNetDataLoader3D
 from nnunetv2.training.dataloading.nnunet_dataset import nnUNetDataset
 from nnunetv2.training.dataloading.utils import get_case_identifiers, unpack_dataset
-from nnunetv2.training.logging.nnunet_logger import nnUNetLogger
+from nnunetv2.training.logging.kd_contrast_logger import KDContrastLogger
+from nnunetv2.training.logging.kd_logger import KD_Logger
 from nnunetv2.training.loss.compound_losses import DC_and_CE_loss, DC_and_BCE_loss
+from nnunetv2.training.loss.contrast_loss import KD_ContrastLoss
 from nnunetv2.training.loss.deep_supervision import DeepSupervisionWrapper
 from nnunetv2.training.loss.dice import get_tp_fp_fn_tn, MemoryEfficientSoftDiceLoss
 from nnunetv2.training.lr_scheduler.polylr import PolyLRScheduler
@@ -67,9 +70,23 @@ from nnunetv2.utilities.get_network_from_plans import get_network_from_plans
 from nnunetv2.utilities.helpers import empty_cache, dummy_context
 from nnunetv2.utilities.label_handling.label_handling import convert_labelmap_to_one_hot, determine_num_input_channels
 from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
+from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
+from dynamic_network_architectures.architectures.embedding_layers import Embedding_Layers
 
+from nnunetv2.training.loss.compound_losses import KD_KLDiv_loss
+import os
+from datetime import datetime
+from threadpoolctl import threadpool_limits
+from collections import deque
 
-class nnUNetTrainer(object):
+# from torch.utils.tensorboard import SummaryWriter
+
+# FP32
+# -> turn off autocast, grad_scaler
+# -> use KLDiv Loss
+# not working...
+
+class Option3_fold1_Trainer(nnUNetTrainer):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict, unpack_dataset: bool = True,
                  device: torch.device = torch.device('cuda')):
         # From https://grugbrain.dev/. Worth a read ya big brains ;-)
@@ -152,7 +169,8 @@ class nnUNetTrainer(object):
         self.num_epochs = 1000
         self.current_epoch = 0
         self.enable_deep_supervision = True
-
+        self.teacher_enable_deep_supervision = True
+        
         ### Dealing with labels/regions
         self.label_manager = self.plans_manager.get_label_manager(dataset_json)
         # labels can either be a list of int (regular training) or a list of tuples of int (region-based training)
@@ -160,10 +178,19 @@ class nnUNetTrainer(object):
 
         self.num_input_channels = None  # -> self.initialize()
         self.network = None  # -> self.build_network_architecture()
+        
+        self.kidney_queue = None
+        self.tumor_queue = None
+        self.background_queue = None
+        self.queue_length = 10
+
+        self.teacher_network = None
         self.optimizer = self.lr_scheduler = None  # -> self.initialize
         self.grad_scaler = GradScaler() if self.device.type == 'cuda' else None
+        # self.grad_scaler = None
         self.loss = None  # -> self.initialize
-
+        self.c_loss = None
+        self.t_loss = None
         ### Simple logging. Don't take that away from me!
         # initialize log file. This is just our log for the print statements etc. Not to be confused with lightning
         # logging
@@ -172,7 +199,7 @@ class nnUNetTrainer(object):
         self.log_file = join(self.output_folder, "training_log_%d_%d_%d_%02.0d_%02.0d_%02.0d.txt" %
                              (timestamp.year, timestamp.month, timestamp.day, timestamp.hour, timestamp.minute,
                               timestamp.second))
-        self.logger = nnUNetLogger()
+        self.logger = KDContrastLogger()
 
         ### placeholders
         self.dataloader_train = self.dataloader_val = None  # see on_train_start
@@ -201,32 +228,60 @@ class nnUNetTrainer(object):
                                "Nature methods, 18(2), 203-211.\n"
                                "#######################################################################\n",
                                also_print_to_console=True, add_timestamp=False)
-
+    
     def initialize(self):
         if not self.was_initialized:
             self.num_input_channels = determine_num_input_channels(self.plans_manager, self.configuration_manager,
                                                                    self.dataset_json)
+            
+            embedding_kwargs = {'input_size' : self.configuration_manager.patch_size,
+                                'features_nums' : self.configuration_manager.network_arch_init_kwargs['features_per_stage'],
+                                'strides' : self.configuration_manager.network_arch_init_kwargs['strides'],
+                                'n_stages' : self.configuration_manager.network_arch_init_kwargs['n_stages']}
+
+            self.teacher_network = self.build_teacher_network_architecture(
+                self.configuration_manager.network_arch_class_name,
+                self.configuration_manager.network_arch_init_kwargs,
+                self.configuration_manager.network_arch_init_kwargs_req_import,
+                2,
+                self.label_manager.num_segmentation_heads - 1,
+                self.enable_deep_supervision,
+                embedding_kwargs
+            ).to(self.device)
 
             self.network = self.build_network_architecture(
                 self.configuration_manager.network_arch_class_name,
                 self.configuration_manager.network_arch_init_kwargs,
                 self.configuration_manager.network_arch_init_kwargs_req_import,
-                self.num_input_channels,
-                self.label_manager.num_segmentation_heads,
-                self.enable_deep_supervision
+                2,
+                self.label_manager.num_segmentation_heads - 1,
+                self.enable_deep_supervision,
+                embedding_kwargs
             ).to(self.device)
+
+
+            input_size = self.configuration_manager.patch_size
+            feature_nums = self.configuration_manager.network_arch_init_kwargs['features_per_stage']
+            strides = self.configuration_manager.network_arch_init_kwargs['strides']
+            n_stages = self.configuration_manager.network_arch_init_kwargs['n_stages']
+            
             # compile network for free speedup
             if self._do_i_compile():
                 self.print_to_log_file('Using torch.compile...')
                 self.network = torch.compile(self.network)
+                self.teacher_network = torch.compile(self.teacher_network)
 
             self.optimizer, self.lr_scheduler = self.configure_optimizers()
             # if ddp, wrap in DDP wrapper
             if self.is_ddp:
                 self.network = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.network)
                 self.network = DDP(self.network, device_ids=[self.local_rank])
+                self.teacher_network = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.teacher_network)
+                self.teacher_network = DDP(self.teacher_network, device_ids=[self.local_rank])
 
             self.loss = self._build_loss()
+            self.c_loss = self._build_c_loss()
+            self.t_loss = self._build_t_loss()
             # torch 2.2.2 crashes upon compiling CE loss
             # if self._do_i_compile():
             #     self.loss = torch.compile(self.loss)
@@ -304,27 +359,9 @@ class nnUNetTrainer(object):
                                    arch_init_kwargs_req_import: Union[List[str], Tuple[str, ...]],
                                    num_input_channels: int,
                                    num_output_channels: int,
-                                   enable_deep_supervision: bool = True) -> nn.Module:
-        """
-        This is where you build the architecture according to the plans. There is no obligation to use
-        get_network_from_plans, this is just a utility we use for the nnU-Net default architectures. You can do what
-        you want. Even ignore the plans and just return something static (as long as it can process the requested
-        patch size)
-        but don't bug us with your bugs arising from fiddling with this :-P
-        This is the function that is called in inference as well! This is needed so that all network architecture
-        variants can be loaded at inference time (inference will use the same nnUNetTrainer that was used for
-        training, so if you change the network architecture during training by deriving a new trainer class then
-        inference will know about it).
-
-        If you need to know how many segmentation outputs your custom architecture needs to have, use the following snippet:
-        > label_manager = plans_manager.get_label_manager(dataset_json)
-        > label_manager.num_segmentation_heads
-        (why so complicated? -> We can have either classical training (classes) or regions. If we have regions,
-        the number of outputs is != the number of classes. Also there is the ignore label for which no output
-        should be generated. label_manager takes care of all that for you.)
-
-        """
-        return get_network_from_plans(
+                                   enable_deep_supervision: bool = True,
+                                   embedding_kwargs: dict = None) -> nn.Module:
+        network = get_network_from_plans(
             architecture_class_name,
             arch_init_kwargs,
             arch_init_kwargs_req_import,
@@ -332,6 +369,52 @@ class nnUNetTrainer(object):
             num_output_channels,
             allow_init=True,
             deep_supervision=enable_deep_supervision)
+        
+        network.make_embedding_layer(**embedding_kwargs)
+
+        if hasattr(network, 'initialize'):
+            network.apply(network.initialize)
+        return network
+    
+    @staticmethod
+    def build_teacher_network_architecture(architecture_class_name: str,
+                                   arch_init_kwargs: dict,
+                                   arch_init_kwargs_req_import: Union[List[str], Tuple[str, ...]],
+                                   num_input_channels: int,
+                                   num_output_channels: int,
+                                   enable_deep_supervision: bool = True,
+                                   embedding_kwargs: dict = None) -> nn.Module:
+        
+        pretrain_network = torch.load("/data/seongwoo/nnunetFrame/nnunet_results/Dataset602_Kits19_fg_concat_CECT/IgnoreTrainer__nnUNetPlans__3d_cascade_fullres/fold_1/checkpoint_final.pth", weights_only=False)['network_weights']
+
+        network = get_network_from_plans(
+            architecture_class_name,
+            arch_init_kwargs,
+            arch_init_kwargs_req_import,
+            num_input_channels,
+            num_output_channels,
+            allow_init=True,
+            deep_supervision=enable_deep_supervision)
+        
+        network.make_embedding_layer(**embedding_kwargs)
+        
+        if hasattr(network, 'initialize'):
+            network.apply(network.initialize)
+        # encoder 파라미터 로드
+        #if isinstance(pretrain_network, dict):
+        #    # 딕셔너리일 경우, 키 목록 출력
+        #    print("Keys in the .pth file:")
+        #    for key in pretrain_network.keys():
+        #        print(f"  - {key}")
+        
+        if isinstance(pretrain_network, dict):  # pretrain_network가 state_dict()인 경우
+            # encoder 관련 키만 추출
+            encoder_state_dict = {k.replace("encoder.", ""): v for k, v in pretrain_network.items() if k.startswith("encoder.")}
+            network.encoder.load_state_dict(encoder_state_dict)
+            decoder_state_dict = {k.replace("decoder.", ""): v for k, v in pretrain_network.items() if k.startswith("decoder.")}
+            network.decoder.load_state_dict(decoder_state_dict)
+        
+        return network
 
     def _get_deep_supervision_scales(self):
         if self.enable_deep_supervision:
@@ -412,6 +495,50 @@ class nnUNetTrainer(object):
                 # weights[-1] = 0. Interestingly this crash doesn't happen with torch.compile enabled. Strange stuff.
                 # Anywho, the simple fix is to set a very low weight to this.
                 weights[-1] = 1e-6
+            else:
+                weights[-1] = 0
+
+            # we don't use the lowest 2 outputs. Normalize weights so that they sum to 1
+            weights = weights / weights.sum()
+            # now wrap the loss
+            loss = DeepSupervisionWrapper(loss, weights)
+
+        return loss
+    
+    def _build_c_loss(self):
+        loss = KD_ContrastLoss()
+        # we give each output a weight which decreases exponentially (division by 2) as the resolution decreases
+        # this gives higher resolution outputs more weight in the loss
+
+        if self.enable_deep_supervision:
+            deep_supervision_scales = self._get_deep_supervision_scales()
+            weights = np.array([1 / (2 ** i) for i in range(len(deep_supervision_scales))])
+            if self.is_ddp and not self._do_i_compile():
+                # very strange and stupid interaction. DDP crashes and complains about unused parameters due to
+                # weights[-1] = 0. Interestingly this crash doesn't happen with torch.compile enabled. Strange stuff.
+                # Anywho, the simple fix is to set a very low weight to this.
+                weights[-1] = 1e-6
+            else:
+                weights[-1] = 0
+
+            # we don't use the lowest 2 outputs. Normalize weights so that they sum to 1
+            weights = weights / weights.sum()
+            # now wrap the loss
+            loss = DeepSupervisionWrapper(loss, weights)
+        return loss
+    
+    def _build_t_loss(self):
+
+        loss = KD_KLDiv_loss(reduction = 'mean', temperature = 5)
+
+        # if self._do_i_compile():
+        #     loss.dc = torch.compile(loss.dc)
+
+        if self.enable_deep_supervision and self.teacher_enable_deep_supervision:
+            deep_supervision_scales = self._get_deep_supervision_scales()
+            weights = np.array([1 / (2 ** i) for i in range(len(deep_supervision_scales))])
+            if self.is_ddp and not self._do_i_compile():
+                weights[-1] = 1e-6  
             else:
                 weights[-1] = 0
 
@@ -503,7 +630,7 @@ class nnUNetTrainer(object):
             self.print_to_log_file('These are the global plan.json settings:\n', dct, '\n', add_timestamp=False)
 
     def configure_optimizers(self):
-        optimizer = torch.optim.SGD(self.network.parameters(), self.initial_lr, weight_decay=self.weight_decay,
+        optimizer = torch.optim.SGD(list(self.network.parameters()), self.initial_lr, weight_decay=self.weight_decay, # + list(self.teacher_network.embedding_layer.parameters())
                                     momentum=0.99, nesterov=True)
         lr_scheduler = PolyLRScheduler(optimizer, self.initial_lr, self.num_epochs)
         return optimizer, lr_scheduler
@@ -805,34 +932,6 @@ class nnUNetTrainer(object):
         transforms.append(
             RemoveLabelTansform(-1, 0)
         )
-        if is_cascaded:
-            assert foreground_labels is not None, 'We need foreground_labels for cascade augmentations'
-            transforms.append(
-                MoveSegAsOneHotToDataTransform(
-                    source_channel_idx=1,
-                    all_labels=foreground_labels,
-                    remove_channel_from_source=True
-                )
-            )
-            transforms.append(
-                RandomTransform(
-                    ApplyRandomBinaryOperatorTransform(
-                        channel_idx=list(range(-len(foreground_labels), 0)),
-                        strel_size=(1, 8),
-                        p_per_label=1
-                    ), apply_probability=0.4
-                )
-            )
-            transforms.append(
-                RandomTransform(
-                    RemoveRandomConnectedComponentFromOneHotEncodingTransform(
-                        channel_idx=list(range(-len(foreground_labels), 0)),
-                        fill_with_other_class_p=0,
-                        dont_do_if_covers_more_than_x_percent=0.15,
-                        p_per_label=1
-                    ), apply_probability=0.2
-                )
-            )
 
         if regions is not None:
             # the ignore label must also be converted
@@ -860,15 +959,6 @@ class nnUNetTrainer(object):
         transforms.append(
             RemoveLabelTansform(-1, 0)
         )
-
-        if is_cascaded:
-            transforms.append(
-                MoveSegAsOneHotToDataTransform(
-                    source_channel_idx=1,
-                    all_labels=foreground_labels,
-                    remove_channel_from_source=True
-                )
-            )
 
         if regions is not None:
             # the ignore label must also be converted
@@ -966,6 +1056,7 @@ class nnUNetTrainer(object):
         self.print_to_log_file("Training done.")
 
     def on_train_epoch_start(self):
+        self.teacher_network.eval()
         self.network.train()
         self.lr_scheduler.step(self.current_epoch)
         self.print_to_log_file('')
@@ -974,27 +1065,82 @@ class nnUNetTrainer(object):
             f"Current learning rate: {np.round(self.optimizer.param_groups[0]['lr'], decimals=5)}")
         # lrs are the same for all workers so we don't need to gather them in case of DDP training
         self.logger.log('lrs', self.optimizer.param_groups[0]['lr'], self.current_epoch)
+        deep_supervision_scales = self._get_deep_supervision_scales()
+        self.kidney_queue = [deque(maxlen=self.queue_length) for _ in range(len(deep_supervision_scales))]
 
     def train_step(self, batch: dict) -> dict:
-        data = batch['data']
-        target = batch['target']
+        temp_data = batch['data']
+        temp_target = batch['target']
+        
+        target = [target_elem[:, 0:1, :, :, :] for target_elem in temp_target]
+        cascade_mask = [target_elem[:, 1:2, :, :, :] for target_elem in temp_target]
+        #print(temp_target[0].shape)
+        data_0 = torch.cat([temp_data[:, 0:1, :, :, :], cascade_mask[0]], dim=1)   # NCCT ch0 + cascade img
+        data_1 = torch.cat([temp_data[:, 1:2, :, :, :], cascade_mask[0]], dim=1)   # CECT ch1 + cascade img
+        
+        data_0 = data_0.to(self.device, non_blocking=True)
+        data_1 = data_1.to(self.device, non_blocking=True)
 
-        data = data.to(self.device, non_blocking=True)
         if isinstance(target, list):
             target = [i.to(self.device, non_blocking=True) for i in target]
+            cascade_mask = [i.to(self.device, non_blocking=True) for i in cascade_mask]
         else:
             target = target.to(self.device, non_blocking=True)
+            cascade_mask = cascade_mask.to(self.device, non_blocking=True)
 
         self.optimizer.zero_grad(set_to_none=True)
         # Autocast can be annoying
         # If the device_type is 'cpu' then it's slow as heck and needs to be disabled.
         # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
         # So autocast will only be active if we have a cuda device.
+        # with autocast(self.device.type, enabled=True) if 0 else dummy_context():
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
-            output = self.network(data)
-            # del data
-            l = self.loss(output, target)
-
+            # Forward pass with the teacher model - do not save gradients here as we do not change the teacher's weights
+            #with torch.no_grad():
+            #    _, features = self.teacher_network.decoder(self.teacher_network.encoder(data_1))
+            #teacher_features = []
+            #for idx, feature in enumerate(features):
+            #    teacher_features.append(self.teacher_network.embedding_layer[idx](feature))
+            teacher_output, _, teacher_embeded_feature = self.teacher_network(data_1)           # CECT, return result, features, embedding_features
+            
+            # Forward pass with the student model
+            student_output, _, student_embeded_feature = self.network(data_0)                       # NCCT
+            
+            foreground_output_s = [torch.where(cascade_mask_elem==1, 
+                                               student_output_elem, 
+                                               torch.full_like(student_output_elem, -100, dtype=torch.float32)
+                                               ) for cascade_mask_elem, student_output_elem in zip(cascade_mask, student_output)]
+            
+            output_s = [torch.cat([torch.where(cascade_mask_elem==1, 
+                                               torch.full_like(cascade_mask_elem, -100, dtype=torch.float32), 
+                                               torch.zeros_like(cascade_mask_elem, dtype=torch.float32)
+                                               ),
+                                    foreground_output_elem], dim=1
+                                    ) for cascade_mask_elem, foreground_output_elem in zip(cascade_mask, foreground_output_s)]
+            
+            foreground_output_t = [torch.where(cascade_mask_elem==1, 
+                                               teacher_output_elem, 
+                                               torch.full_like(teacher_output_elem, -100, dtype=torch.float32)
+                                               ) for cascade_mask_elem, teacher_output_elem in zip(cascade_mask, teacher_output)]
+            
+            output_t = [torch.cat([torch.where(cascade_mask_elem==1, 
+                                               torch.full_like(cascade_mask_elem, -100, dtype=torch.float32), 
+                                               torch.zeros_like(cascade_mask_elem, dtype=torch.float32)
+                                               ),
+                                    foreground_output_elem], dim=1
+                                    ) for cascade_mask_elem, foreground_output_elem in zip(cascade_mask, foreground_output_t)]
+            student_l = self.loss(output_s, target) 
+            sim_loss = self.c_loss(student_output, teacher_output, student_embeded_feature, teacher_embeded_feature, target, self.kidney_queue)
+            
+        kd_loss = torch.tensor([0], device=self.device)
+        
+        # Weight needs to be adjusted
+        student_weight = 1
+        sim_weight = 1 - (self.current_epoch / self.num_epochs)
+        kd_weight = 0.33
+        # l = student_weight * student_l + kd_weight * kd_loss
+        l = student_weight * student_l + sim_weight * sim_loss
+            
         if self.grad_scaler is not None:
             self.grad_scaler.scale(l).backward()
             self.grad_scaler.unscale_(self.optimizer)
@@ -1005,7 +1151,8 @@ class nnUNetTrainer(object):
             l.backward()
             torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
             self.optimizer.step()
-        return {'loss': l.detach().cpu().numpy()}
+        return {'loss': student_l.detach().cpu().numpy(), 'kd_loss' : kd_loss.detach().cpu().numpy(), 'c_loss' : sim_loss.detach().cpu().numpy()}
+
 
     def on_train_epoch_end(self, train_outputs: List[dict]):
         outputs = collate_outputs(train_outputs)
@@ -1016,29 +1163,74 @@ class nnUNetTrainer(object):
             loss_here = np.vstack(losses_tr).mean()
         else:
             loss_here = np.mean(outputs['loss'])
-
+            kd_loss_here = np.mean(outputs['kd_loss'])
+            c_loss_here = np.mean(outputs['c_loss'])
+            
+        torch.cuda.empty_cache()
         self.logger.log('train_losses', loss_here, self.current_epoch)
+        self.logger.log('train_kd_losses', kd_loss_here, self.current_epoch)
+        self.logger.log('train_c_losses', c_loss_here, self.current_epoch)
+        for queue in self.kidney_queue:
+            queue.clear()
 
     def on_validation_epoch_start(self):
         self.network.eval()
 
     def validation_step(self, batch: dict) -> dict:
-        data = batch['data']
-        target = batch['target']
+        temp_data = batch['data']
+        temp_target = batch['target']
+        
+        target = [target_elem[:, 0:1, :, :, :] for target_elem in temp_target]
+        cascade_mask = [target_elem[:, 1:2, :, :, :] for target_elem in temp_target]
+        #print(temp_target[0].shape)
+        data_0 = torch.cat([temp_data[:, 0:1, :, :, :], cascade_mask[0]], dim=1)   # NCCT ch0 + cascade img
+        data_1 = torch.cat([temp_data[:, 1:2, :, :, :], cascade_mask[0]], dim=1)   # CECT ch1 + cascade img
+        
+        data_0 = data_0.to(self.device, non_blocking=True)
+        data_1 = data_1.to(self.device, non_blocking=True)
 
-        data = data.to(self.device, non_blocking=True)
         if isinstance(target, list):
             target = [i.to(self.device, non_blocking=True) for i in target]
+            cascade_mask = [i.to(self.device, non_blocking=True) for i in cascade_mask]
         else:
             target = target.to(self.device, non_blocking=True)
+            cascade_mask = cascade_mask.to(self.device, non_blocking=True)
 
-        # Autocast can be annoying
-        # If the device_type is 'cpu' then it's slow as heck and needs to be disabled.
-        # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
-        # So autocast will only be active if we have a cuda device.
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
-            output = self.network(data)
-            del data
+            teacher_output, _, teacher_embeded_feature = self.teacher_network(data_1)           # CECT, return result, features, embedding_features
+            
+            # Forward pass with the student model
+            student_output, _, student_embeded_feature = self.network(data_0)                       # NCCT
+            
+            foreground_output_s = [torch.where(cascade_mask_elem==1, 
+                                               student_output_elem, 
+                                               torch.full_like(student_output_elem, -100, dtype=torch.float32)
+                                               ) for cascade_mask_elem, student_output_elem in zip(cascade_mask, student_output)]
+            
+            output_s = [torch.cat([torch.where(cascade_mask_elem==1, 
+                                               torch.full_like(cascade_mask_elem, -100, dtype=torch.float32), 
+                                               torch.zeros_like(cascade_mask_elem, dtype=torch.float32)
+                                               ),
+                                    foreground_output_elem], dim=1
+                                    ) for cascade_mask_elem, foreground_output_elem in zip(cascade_mask, foreground_output_s)]
+            
+            foreground_output_t = [torch.where(cascade_mask_elem==1, 
+                                               teacher_output_elem, 
+                                               torch.full_like(teacher_output_elem, -100, dtype=torch.float32)
+                                               ) for cascade_mask_elem, teacher_output_elem in zip(cascade_mask, teacher_output)]
+            
+            output_t = [torch.cat([torch.where(cascade_mask_elem==1, 
+                                               torch.full_like(cascade_mask_elem, -100, dtype=torch.float32), 
+                                               torch.zeros_like(cascade_mask_elem, dtype=torch.float32)
+                                               ),
+                                    foreground_output_elem], dim=1
+                                    ) for cascade_mask_elem, foreground_output_elem in zip(cascade_mask, foreground_output_t)]
+            output = output_s
+            del temp_data
+            del data_0
+            del data_1
+            kd_loss = torch.tensor([0], device=self.device)
+            sim_loss = self.c_loss(student_output, teacher_output, student_embeded_feature, teacher_embeded_feature, target, self.kidney_queue)
             l = self.loss(output, target)
 
         # we only need the output with the highest output resolution (if DS enabled)
@@ -1087,9 +1279,11 @@ class nnUNetTrainer(object):
             fp_hard = fp_hard[1:]
             fn_hard = fn_hard[1:]
 
-        return {'loss': l.detach().cpu().numpy(), 'tp_hard': tp_hard, 'fp_hard': fp_hard, 'fn_hard': fn_hard}
+        return {'loss': l.detach().cpu().numpy(), 'tp_hard': tp_hard, 'fp_hard': fp_hard, 'fn_hard': fn_hard, 'kd_loss' : kd_loss.detach().cpu().numpy(), 'c_loss' : sim_loss.detach().cpu().numpy()}
 
     def on_validation_epoch_end(self, val_outputs: List[dict]):
+        for queue in self.kidney_queue:
+            queue.clear()
         outputs_collated = collate_outputs(val_outputs)
         tp = np.sum(outputs_collated['tp_hard'], 0)
         fp = np.sum(outputs_collated['fp_hard'], 0)
@@ -1115,12 +1309,16 @@ class nnUNetTrainer(object):
             loss_here = np.vstack(losses_val).mean()
         else:
             loss_here = np.mean(outputs_collated['loss'])
+            kd_loss_here = np.mean(outputs_collated['kd_loss'])
+            c_loss_here = np.mean(outputs_collated['c_loss'])
 
         global_dc_per_class = [i for i in [2 * i / (2 * i + j + k) for i, j, k in zip(tp, fp, fn)]]
         mean_fg_dice = np.nanmean(global_dc_per_class)
         self.logger.log('mean_fg_dice', mean_fg_dice, self.current_epoch)
         self.logger.log('dice_per_class_or_region', global_dc_per_class, self.current_epoch)
         self.logger.log('val_losses', loss_here, self.current_epoch)
+        self.logger.log('val_kd_losses', kd_loss_here, self.current_epoch)
+        self.logger.log('val_c_losses', c_loss_here, self.current_epoch)
 
     def on_epoch_start(self):
         self.logger.log('epoch_start_timestamps', time(), self.current_epoch)
@@ -1130,6 +1328,11 @@ class nnUNetTrainer(object):
 
         self.print_to_log_file('train_loss', np.round(self.logger.my_fantastic_logging['train_losses'][-1], decimals=4))
         self.print_to_log_file('val_loss', np.round(self.logger.my_fantastic_logging['val_losses'][-1], decimals=4))
+        self.print_to_log_file('train_c_loss', np.round(self.logger.my_fantastic_logging['train_c_losses'][-1], decimals=4))
+        self.print_to_log_file('val_c_loss', np.round(self.logger.my_fantastic_logging['val_c_losses'][-1], decimals=4))
+        self.print_to_log_file('train_kd_loss', np.round(self.logger.my_fantastic_logging['train_kd_losses'][-1], decimals=4))
+        self.print_to_log_file('val_kd_loss', np.round(self.logger.my_fantastic_logging['val_kd_losses'][-1], decimals=4))
+        
         self.print_to_log_file('Pseudo dice', [np.round(i, decimals=4) for i in
                                                self.logger.my_fantastic_logging['dice_per_class_or_region'][-1]])
         self.print_to_log_file(
@@ -1228,9 +1431,12 @@ class nnUNetTrainer(object):
                                    "forward pass (where compile is triggered) already has deep supervision disabled. "
                                    "This is exactly what we need in perform_actual_validation")
 
-        predictor = nnUNetPredictor(tile_step_size=0.5, use_gaussian=True, use_mirroring=True,
-                                    perform_everything_on_device=True, device=self.device, verbose=False,
-                                    verbose_preprocessing=False, allow_tqdm=False)
+        predictor = OptionPredictor(tile_step_size=0.5, use_gaussian=True, use_mirroring=True,
+                                     perform_everything_on_device=True, device=self.device, verbose=False,
+                                     verbose_preprocessing=False, allow_tqdm=False)
+        #predictor = IgnorePredictor(tile_step_size=0.5, use_gaussian=True, use_mirroring=True,
+        #                            perform_everything_on_device=True, device=self.device, verbose=False,
+        #                            verbose_preprocessing=False, allow_tqdm=False)
         predictor.manual_initialization(self.network, self.plans_manager, self.configuration_manager, None,
                                         self.dataset_json, self.__class__.__name__,
                                         self.inference_allowed_mirroring_axes)
@@ -1271,10 +1477,14 @@ class nnUNetTrainer(object):
 
                 self.print_to_log_file(f"predicting {k}")
                 data, seg, properties = dataset_val.load_case(k)
-
-                if self.is_cascaded:
-                    data = np.vstack((data, convert_labelmap_to_one_hot(seg[-1], self.label_manager.foreground_labels,
-                                                                        output_dtype=data.dtype)))
+                data = data[0:1, :, :, :]
+                cascade_data = seg[1:2, :, :, :]
+                data = np.vstack((data, cascade_data))
+                cascade_data = torch.from_numpy(cascade_data)
+                cascade_data = cascade_data.to(self.device, non_blocking=True)
+                #if self.is_cascaded:
+                #    data = np.vstack((data, convert_labelmap_to_one_hot(seg[-1], self.label_manager.foreground_labels,
+                #                                                        output_dtype=data.dtype)))
                 with warnings.catch_warnings():
                     # ignore 'The given NumPy array is not writable' warning
                     warnings.simplefilter("ignore")
@@ -1284,6 +1494,32 @@ class nnUNetTrainer(object):
                 output_filename_truncated = join(validation_output_folder, k)
 
                 prediction = predictor.predict_sliding_window_return_logits(data)
+                foreground_logits = torch.where(
+                                    cascade_data == 1, 
+                                    prediction, 
+                                    torch.full_like(
+                                        prediction, 
+                                        ##float('-inf'),
+                                        -100, 
+                                        dtype=torch.float32
+                                        )
+                                    ) 
+                                
+                prediction = torch.cat([
+                                torch.where(
+                                    cascade_data == 1, 
+                                    torch.full_like(
+                                        cascade_data, 
+                                        ##float('-inf'),
+                                        -100,
+                                        dtype=torch.float32
+                                    ), 
+                                    torch.zeros_like(
+                                        cascade_data, 
+                                        dtype=torch.float32
+                                    )
+                                ),
+                                foreground_logits], dim=0)
                 prediction = prediction.cpu()
 
                 # this needs to go into background processes

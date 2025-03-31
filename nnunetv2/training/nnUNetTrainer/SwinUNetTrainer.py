@@ -40,13 +40,14 @@ from torch import autocast, nn
 from torch import distributed as dist
 from torch._dynamo import OptimizedModule
 from torch.cuda import device_count
-from torch.amp import GradScaler
+from torch.cuda.amp import GradScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from nnunetv2.configuration import ANISO_THRESHOLD, default_num_processes
 from nnunetv2.evaluation.evaluate_predictions import compute_metrics_on_folder
 from nnunetv2.inference.export_prediction import export_prediction_from_logits, resample_and_save
 from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
+from nnunetv2.inference.swin_predict_from_raw_data import swinUNetPredictor
 from nnunetv2.inference.sliding_window_prediction import compute_gaussian
 from nnunetv2.paths import nnUNet_preprocessed, nnUNet_results
 from nnunetv2.training.data_augmentation.compute_initial_patch_size import get_patch_size
@@ -67,9 +68,10 @@ from nnunetv2.utilities.get_network_from_plans import get_network_from_plans
 from nnunetv2.utilities.helpers import empty_cache, dummy_context
 from nnunetv2.utilities.label_handling.label_handling import convert_labelmap_to_one_hot, determine_num_input_channels
 from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
+from monai.networks.nets import SwinUNETR
+from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
 
-
-class nnUNetTrainer(object):
+class SwinUNetTrainer(nnUNetTrainer):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict, unpack_dataset: bool = True,
                  device: torch.device = torch.device('cuda')):
         # From https://grugbrain.dev/. Worth a read ya big brains ;-)
@@ -151,7 +153,7 @@ class nnUNetTrainer(object):
         self.num_val_iterations_per_epoch = 50
         self.num_epochs = 1000
         self.current_epoch = 0
-        self.enable_deep_supervision = True
+        self.enable_deep_supervision = False
 
         ### Dealing with labels/regions
         self.label_manager = self.plans_manager.get_label_manager(dataset_json)
@@ -207,18 +209,21 @@ class nnUNetTrainer(object):
             self.num_input_channels = determine_num_input_channels(self.plans_manager, self.configuration_manager,
                                                                    self.dataset_json)
 
-            self.network = self.build_network_architecture(
-                self.configuration_manager.network_arch_class_name,
-                self.configuration_manager.network_arch_init_kwargs,
-                self.configuration_manager.network_arch_init_kwargs_req_import,
-                self.num_input_channels,
-                self.label_manager.num_segmentation_heads,
-                self.enable_deep_supervision
-            ).to(self.device)
+            input_volume_size = self.configuration_manager.patch_size
+            self.network = SwinUNETR(
+                                img_size=input_volume_size,
+                                in_channels=self.num_input_channels,
+                                out_channels=self.label_manager.num_segmentation_heads,
+                                feature_size=48,
+                                drop_rate=0.0,
+                                attn_drop_rate=0.0,
+                                dropout_path_rate=0.0,
+                                use_checkpoint=True,
+                            ).to(self.device)
             # compile network for free speedup
-            if self._do_i_compile():
-                self.print_to_log_file('Using torch.compile...')
-                self.network = torch.compile(self.network)
+            #if self._do_i_compile():
+            #    self.print_to_log_file('Using torch.compile...')
+            #    self.network = torch.compile(self.network)
 
             self.optimizer, self.lr_scheduler = self.configure_optimizers()
             # if ddp, wrap in DDP wrapper
@@ -503,10 +508,9 @@ class nnUNetTrainer(object):
             self.print_to_log_file('These are the global plan.json settings:\n', dct, '\n', add_timestamp=False)
 
     def configure_optimizers(self):
-        optimizer = torch.optim.SGD(self.network.parameters(), self.initial_lr, weight_decay=self.weight_decay,
-                                    momentum=0.99, nesterov=True)
-        lr_scheduler = PolyLRScheduler(optimizer, self.initial_lr, self.num_epochs)
-        return optimizer, lr_scheduler
+        optimizer = torch.optim.AdamW(self.network.parameters(), lr=1e-4, weight_decay=1e-5)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.num_epochs)
+        return optimizer, scheduler
 
     def plot_network_architecture(self):
         if self._do_i_compile():
@@ -895,7 +899,7 @@ class nnUNetTrainer(object):
         if isinstance(mod, OptimizedModule):
             mod = mod._orig_mod
 
-        mod.decoder.deep_supervision = enabled
+        #mod.decoder.deep_supervision = enabled
 
     def on_train_start(self):
         # dataloaders must be instantiated here (instead of __init__) because they need access to the training data
@@ -992,6 +996,7 @@ class nnUNetTrainer(object):
         # So autocast will only be active if we have a cuda device.
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
             output = self.network(data)
+            ##print(output)
             # del data
             l = self.loss(output, target)
 
@@ -1228,7 +1233,7 @@ class nnUNetTrainer(object):
                                    "forward pass (where compile is triggered) already has deep supervision disabled. "
                                    "This is exactly what we need in perform_actual_validation")
 
-        predictor = nnUNetPredictor(tile_step_size=0.5, use_gaussian=True, use_mirroring=True,
+        predictor = swinUNetPredictor(tile_step_size=0.5, use_gaussian=True, use_mirroring=True,
                                     perform_everything_on_device=True, device=self.device, verbose=False,
                                     verbose_preprocessing=False, allow_tqdm=False)
         predictor.manual_initialization(self.network, self.plans_manager, self.configuration_manager, None,
